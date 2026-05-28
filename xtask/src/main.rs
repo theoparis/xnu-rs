@@ -248,6 +248,7 @@ fn gpt_error<E: std::fmt::Display>(err: E) -> io::Error {
     io::Error::other(err.to_string())
 }
 
+#[allow(clippy::too_many_lines)]
 fn convert_elf_to_macho(src: &Path, dst: &Path) -> io::Result<()> {
     let elf_bytes = fs::read(src)?;
     let elf = Elf::parse(&elf_bytes).map_err(|err| io::Error::other(err.to_string()))?;
