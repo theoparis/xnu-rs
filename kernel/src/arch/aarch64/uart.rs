@@ -24,7 +24,7 @@ pub fn write_hex_u64(value: u64) {
     }
 }
 
-fn write_byte(byte: u8) {
+pub fn write_byte(byte: u8) {
     // SAFETY: QEMU virt exposes a PL011 UART at 0x0900_0000. This is a volatile MMIO write.
     unsafe {
         core::ptr::write_volatile(PL011_UART_DR as *mut u32, u32::from(byte));

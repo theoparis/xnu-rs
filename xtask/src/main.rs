@@ -494,7 +494,7 @@ fn run_qemu() -> io::Result<bool> {
             "-accel",
             "tcg,thread=multi",
             "-cpu",
-            "cortex-a72",
+            "cortex-a53",
             "-m",
             "1024M",
             "-nographic",
