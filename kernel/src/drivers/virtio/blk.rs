@@ -1,6 +1,6 @@
-use super::transport::{VirtioMmio, QUEUE_SIZE};
+use super::transport::{QUEUE_SIZE, VirtioMmio};
 use crate::arch::aarch64::uart;
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{Ordering, fence};
 use spin::Once;
 
 const BLK_T_IN: u32 = 0; // read
@@ -165,7 +165,7 @@ pub static VIRTIO_BLK: Once<spin::Mutex<VirtioBlk>> = Once::new();
 
 /// Initialize virtio-blk. Call from kernel main after MMU setup.
 pub fn init() {
-    for slot in 0..8_usize {
+    for slot in 0..32_usize {
         // SAFETY: MMIO region is identity-mapped by `mmu::init_kernel_tables()`.
         if let Some(mmio) = unsafe { VirtioMmio::probe(slot, 2) } {
             uart::write_str("xnu-rs: virtio-blk found at slot 0x");

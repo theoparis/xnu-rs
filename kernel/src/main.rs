@@ -8,7 +8,7 @@ mod device_tree;
 
 use boot_args::BootArgs;
 use core::{panic::PanicInfo, ptr, slice};
-use kernel::arch::aarch64::{boot, gic, mmu, smp, uart};
+use kernel::arch::aarch64::{boot, exception, gic, mmu, smp, uart};
 use kernel::mm;
 use kernel::sched;
 
@@ -35,10 +35,22 @@ pub extern "C" fn _start(boot_args: *const BootArgs) -> ! {
     // Use phys_base/mem_size from boot args when available; fall back to
     // conservative defaults that cover QEMU virt RAM at 0x40000000 (256 MiB).
     let (phys_base, mem_size, kernel_end) = args.map_or(
-        (0x4000_0000u64, 256 * 1024 * 1024u64, 0x4020_0000u64 + 4 * 1024 * 1024),
+        (
+            0x4000_0000u64,
+            256 * 1024 * 1024u64,
+            0x4020_0000u64 + 4 * 1024 * 1024,
+        ),
         |a| (a.phys_base, a.mem_size, a.top_of_kernel_data),
     );
     mm::frame::init(phys_base, mem_size, 0x4020_0000, kernel_end);
+
+    // Install exception vectors before MMU init so any faults are caught.
+    // SAFETY: Called during single-core early boot before any EL0 activity.
+    unsafe { exception::install_vectors() };
+
+    // Populate the Darwin commpage.
+    // SAFETY: Called during early boot before MMU or EL0 is active.
+    unsafe { mmu::init_commpage() };
 
     // Enable the MMU with a TTBR0 identity map covering all RAM and MMIO.
     // SAFETY: Frame allocator is initialised; page tables are static BSS.
@@ -70,10 +82,21 @@ pub extern "C" fn _start(boot_args: *const BootArgs) -> ! {
 
     // Initialize virtio-blk driver.
     kernel::drivers::virtio::init_blk();
+    kernel::fs::xnrsfs::list_files();
 
     // Boot secondary CPUs via PSCI.
     // SAFETY: GIC distributor is initialized; called from CPU0.
     unsafe { smp::boot_secondaries(4) };
+
+    // Try to load dyld+zsh from the rootfs disk. Fall back to the embedded
+    // test binary if no rootfs is present (no virtio-blk found).
+    if kernel::drivers::virtio::blk::VIRTIO_BLK.get().is_some() {
+        // SAFETY: `load_base` is aligned, past the kernel, in valid RAM,
+        // with enough room for dyld + zsh + stack.
+        unsafe {
+            kernel::exec::loader::load_dyld_and_run(load_base);
+        }
+    }
 
     // SAFETY: `load_base` is aligned, past the kernel, and in valid RAM.
     // The exception vectors will be installed inside `load_and_run`.

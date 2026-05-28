@@ -1,4 +1,4 @@
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{Ordering, fence};
 
 const MMIO_BASE: u64 = 0x0A00_0000;
 const MMIO_STRIDE: u64 = 0x200;
@@ -111,14 +111,16 @@ impl VirtioMmio {
             return None;
         }
 
-        // SAFETY: Same as above.
+        // SAFETY: Caller guarantees MMIO is identity-mapped.
         let version = unsafe { Self::read_reg_raw(base, REG_VERSION) };
-        if version != 1 {
+        // SAFETY: Caller guarantees MMIO is identity-mapped.
+        let device_id = unsafe { Self::read_reg_raw(base, REG_DEVICE_ID) };
+
+        // Support both legacy (v1) and modern (v2) transports.
+        if version != 1 && version != 2 {
             return None;
         }
 
-        // SAFETY: Same as above.
-        let device_id = unsafe { Self::read_reg_raw(base, REG_DEVICE_ID) };
         if device_id != expected_device_id {
             return None;
         }
@@ -304,8 +306,7 @@ impl VirtioMmio {
         loop {
             fence(Ordering::Acquire);
             // SAFETY: `used` points to valid initialized shared memory; volatile read required.
-            let used_idx =
-                unsafe { core::ptr::read_volatile(&raw const (*self.queue.used).idx) };
+            let used_idx = unsafe { core::ptr::read_volatile(&raw const (*self.queue.used).idx) };
             if used_idx != self.queue.last_used_idx {
                 // SAFETY: `ring` index is masked to [0, QUEUE_SIZE).
                 let elem_id = unsafe {

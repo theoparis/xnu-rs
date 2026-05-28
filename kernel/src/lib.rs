@@ -5,8 +5,8 @@
 extern crate alloc as liballoc;
 
 pub mod alloc;
-pub mod drivers;
 pub mod arch;
+pub mod drivers;
 pub mod exec;
 pub mod fs;
 pub mod ipc;

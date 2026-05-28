@@ -1,10 +1,14 @@
-/// SMP bring-up for `AArch64` using PSCI via HVC.
+/// SMP bring-up for `AArch64` using PSCI via SMC.
 use super::{gic, uart};
 
-/// PSCI `CPU_ON` function ID (SMC64 calling convention via HVC).
+/// PSCI `CPU_ON` function ID (SMC64 calling convention).
 const PSCI_CPU_ON: u64 = 0x8400_0003;
 
-/// Invoke a PSCI function via HVC.
+/// Invoke a PSCI function via SMC (traps to EL3 where QEMU implements PSCI).
+///
+/// With `virtualization=on` QEMU exposes real EL2 hardware. UEFI runs at EL2
+/// and leaves its own EL2 vector table which does not handle PSCI HVC calls.
+/// PSCI must therefore be invoked via SMC which always reaches EL3.
 ///
 /// Returns 0 on success, negative on error.
 ///
@@ -13,10 +17,10 @@ const PSCI_CPU_ON: u64 = 0x8400_0003;
 /// Caller must ensure `func`, `arg1`, `arg2`, `arg3` are valid PSCI arguments.
 unsafe fn psci_call(func: u64, arg1: u64, arg2: u64, arg3: u64) -> i64 {
     let ret: i64;
-    // SAFETY: HVC #0 invokes the hypervisor (PSCI) with the given register values.
+    // SAFETY: SMC #0 invokes EL3 (PSCI) with the given register values.
     unsafe {
         core::arch::asm!(
-            "hvc #0",
+            "smc #0",
             inout("x0") func => ret,
             in("x1") arg1,
             in("x2") arg2,
@@ -32,7 +36,9 @@ unsafe fn psci_call(func: u64, arg1: u64, arg2: u64, arg3: u64) -> i64 {
 pub fn this_cpu() -> u32 {
     let mpidr: u64;
     // SAFETY: MPIDR_EL1 is a read-only architectural register, always accessible at EL1.
-    unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nostack, preserves_flags)) };
+    unsafe {
+        core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nostack, preserves_flags));
+    }
     (mpidr & 0xFF) as u32
 }
 
@@ -92,7 +98,8 @@ pub unsafe fn boot_secondaries(count: u32) {
 // Secondary CPU entry point (assembly) and Rust main
 // ---------------------------------------------------------------------------
 
-core::arch::global_asm!(r#"
+core::arch::global_asm!(
+    r#"
     .global secondary_entry
 secondary_entry:
     // x0 = context_id = stack top (passed by PSCI as context_id argument)
@@ -105,7 +112,8 @@ secondary_entry:
 1:
     wfi
     b 1b
-"#);
+"#
+);
 
 /// Rust entry point for secondary CPUs.
 ///

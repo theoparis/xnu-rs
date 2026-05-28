@@ -97,25 +97,19 @@ fn allocate_load_ranges(macho: &MachO<'_>) -> Result<(), Status> {
     }
 
     for range in merged {
-        let size = range
-            .end
-            .checked_sub(range.start)
-            .ok_or(Status::LOAD_ERROR)?;
-        let pages_u64 = size.div_ceil(PAGE_SIZE as u64);
-        let pages = usize::try_from(pages_u64).map_err(|_| Status::LOAD_ERROR)?;
-
-        boot::allocate_pages(
-            AllocateType::Address(range.start),
-            MemoryType::LOADER_CODE,
-            pages,
-        )
-        .map_err(|err| err.status())?;
-
-        let len = usize::try_from(size).map_err(|_| Status::LOAD_ERROR)?;
-        let ptr = usize::try_from(range.start).map_err(|_| Status::LOAD_ERROR)? as *mut u8;
-        // SAFETY: The pages covering [range.start, range.end) were allocated by UEFI above,
-        // and `len` is derived from that exact range.
-        unsafe { write_bytes(ptr, 0, len) };
+        // Allocate one page at a time so each request stays within a single
+        // memory-map entry. A multi-page AllocateType::Address call fails when
+        // the range spans entry boundaries (seen with -cpu max / OVMF).
+        let mut cursor = range.start;
+        while cursor < range.end {
+            let next = cursor + PAGE_SIZE as u64;
+            boot::allocate_pages(AllocateType::Address(cursor), MemoryType::LOADER_CODE, 1)
+                .map_err(|err| err.status())?;
+            let ptr = cursor as *mut u8;
+            // SAFETY: The page at `cursor` was just allocated by UEFI above.
+            unsafe { write_bytes(ptr, 0, PAGE_SIZE) };
+            cursor = next;
+        }
     }
 
     Ok(())

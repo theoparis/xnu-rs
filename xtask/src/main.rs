@@ -1,5 +1,6 @@
 use std::{
     env, fs, io,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, ExitCode},
 };
@@ -37,10 +38,11 @@ fn main() -> ExitCode {
         "clippy" => clippy(),
         "fmt" => cargo(&["fmt", "--all", "--", "--check"]),
         "build-image" => build_image(),
+        "make-rootfs" => make_rootfs(args.collect::<Vec<String>>().as_slice()),
         "run" | "qemu" => run_qemu(),
         _ => {
             eprintln!("unknown command: {cmd}");
-            eprintln!("usage: cargo xtask <check|clippy|fmt|build-image|run>");
+            eprintln!("usage: cargo xtask <check|clippy|fmt|build-image|make-rootfs|run>");
             return ExitCode::from(2);
         }
     };
@@ -485,30 +487,189 @@ fn qemu_firmware_path() -> io::Result<PathBuf> {
     ))
 }
 
+/// Build a rootfs disk image in the xnrsfs flat format.
+///
+/// Usage: `cargo xtask make-rootfs [file:path/on/disk] ...`
+///
+/// Each argument is `name:host_path`. The image is written to
+/// `target/qemu/images/rootfs.img`.
+///
+/// xnrsfs layout (all little-endian):
+///   Bytes  0–3:  magic = 0x53524E58 ("XNRS")
+///   Bytes  4–7:  file count (u32)
+///   Bytes  8–(8+count*80): file table entries:
+///     [64]: null-terminated name
+///     [ 8]: data offset (u64) from start of image
+///     [ 8]: data size (u64)
+///   Remainder: file data at 4096-byte aligned offsets
+#[allow(clippy::too_many_lines, clippy::collapsible_if)]
+fn make_rootfs(file_args: &[String]) -> io::Result<bool> {
+    const MAGIC: u32 = 0x5352_4E58; // "XNRS" LE
+    const ENTRY_SIZE: usize = 80; // 64 name + 8 offset + 8 size
+    const ALIGN: u64 = 4096;
+
+    let out_dir = Path::new("target/qemu/images");
+    fs::create_dir_all(out_dir)?;
+    let out_path = out_dir.join("rootfs.img");
+
+    // Parse arguments: "virtname:hostpath"
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    for arg in file_args {
+        let Some((name, host)) = arg.split_once(':') else {
+            eprintln!("make-rootfs: bad arg '{arg}' (expected name:path)");
+            return Ok(false);
+        };
+        files.push((name.to_string(), PathBuf::from(host)));
+    }
+
+    if files.is_empty() {
+        // Default: add dyld and zsh from the host if they exist.
+        for (name, host) in [("/usr/lib/dyld", "/usr/lib/dyld"), ("/bin/zsh", "/bin/zsh")] {
+            let p = Path::new(host);
+            if p.exists() {
+                files.push((name.to_string(), p.to_path_buf()));
+            }
+        }
+        // Dyld shared cache (arm64e, split-file format).
+        let cache_dirs = [
+            Path::new("/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld"),
+            Path::new("/System/Library/dyld"),
+        ];
+        for cache_dir in cache_dirs {
+            if let Ok(entries) = fs::read_dir(cache_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                        if filename.starts_with("dyld_shared_cache_arm64e") {
+                            let dest_path = format!("/System/Library/dyld/{filename}");
+                            if !files.iter().any(|(d, _)| d == &dest_path) {
+                                files.push((dest_path, path));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if files.is_empty() {
+            eprintln!("make-rootfs: no files specified and no host binaries found");
+            return Ok(false);
+        }
+    }
+
+    let count = files.len();
+    let table_bytes = count * ENTRY_SIZE;
+    let header_bytes = 8 + table_bytes; // 4 magic + 4 count + table
+
+    // Compute per-file aligned offsets.
+    let mut offsets: Vec<u64> = Vec::with_capacity(count);
+    let mut next_offset = ((header_bytes as u64) + ALIGN - 1) & !(ALIGN - 1);
+    let mut sizes: Vec<u64> = Vec::with_capacity(count);
+    for (_, host_path) in &files {
+        offsets.push(next_offset);
+        let sz = fs::metadata(host_path).map_or(0, |m| m.len());
+        sizes.push(sz);
+        next_offset = (next_offset + sz + ALIGN - 1) & !(ALIGN - 1);
+    }
+    let total = next_offset;
+
+    println!(
+        "make-rootfs: creating {} ({total} bytes, {count} files)",
+        out_path.display(),
+    );
+
+    // Write the image.
+    let mut img = fs::File::create(&out_path)?;
+
+    // Header: magic + count.
+    img.write_all(&MAGIC.to_le_bytes())?;
+    img.write_all(&u32::try_from(count).unwrap_or(0).to_le_bytes())?;
+
+    // File table.
+    for i in 0..count {
+        let mut name_buf = [0u8; 64];
+        let name_bytes = files[i].0.as_bytes();
+        let copy_len = name_bytes.len().min(63);
+        name_buf[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
+        img.write_all(&name_buf)?;
+        img.write_all(&offsets[i].to_le_bytes())?;
+        img.write_all(&sizes[i].to_le_bytes())?;
+    }
+
+    // Pad to first file offset.
+    let header_end = 8 + table_bytes;
+    let pad_to = usize::try_from(offsets[0]).unwrap_or(0);
+    if pad_to > header_end {
+        let pad = vec![0u8; pad_to - header_end];
+        img.write_all(&pad)?;
+    }
+
+    // Write each file with alignment padding.
+    for i in 0..count {
+        let (_, host_path) = &files[i];
+        print!("  adding {} ({} bytes)... ", host_path.display(), sizes[i]);
+        std::io::stdout().flush()?;
+
+        let mut file = fs::File::open(host_path)?;
+        let mut buffer = vec![0u8; 1024 * 1024];
+        let mut bytes_written = 0u64;
+        loop {
+            let n = file.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            img.write_all(&buffer[..n])?;
+            bytes_written += n as u64;
+        }
+
+        // Pad to next alignment.
+        let next = if i + 1 < count { offsets[i + 1] } else { total };
+        let written = offsets[i] + bytes_written;
+        if next > written {
+            let pad = vec![0u8; usize::try_from(next - written).unwrap_or(0)];
+            img.write_all(&pad)?;
+        }
+        println!("ok");
+    }
+
+    println!("make-rootfs: done → {}", out_path.display());
+    Ok(true)
+}
+
 fn run_qemu() -> io::Result<bool> {
     let _ = build_image()?;
     let firmware = qemu_firmware_path()?;
-    let status = Command::new("qemu-system-aarch64")
-        .args([
-            "-M",
-            "virt,virtualization=on",
-            "-accel",
-            "tcg,thread=multi",
-            "-cpu",
-            "cortex-a53",
-            "-m",
-            "1024M",
-            "-nographic",
-            "-serial",
-            "mon:stdio",
-            "-bios",
-        ])
-        .arg(firmware)
-        .args([
+    let rootfs_path = "target/qemu/images/rootfs.img";
+    let mut cmd = Command::new("qemu-system-aarch64");
+    cmd.args([
+        "-M",
+        "virt,virtualization=on",
+        "-accel",
+        "tcg,thread=multi",
+        "-cpu",
+        "max",
+        "-m",
+        "2048M",
+        "-nographic",
+        "-serial",
+        "mon:stdio",
+        "-bios",
+    ])
+    .arg(firmware)
+    // ESP (UEFI boot + kernel) via virtio-pci — UEFI finds this.
+    .args([
+        "-drive",
+        "if=virtio,format=raw,file=target/qemu/images/esp.img",
+    ]);
+    // Rootfs via virtio-mmio — kernel finds this at 0x0a000000.
+    if std::path::Path::new(rootfs_path).exists() {
+        cmd.args([
             "-drive",
-            "if=virtio,format=raw,file=target/qemu/images/esp.img",
-        ])
-        .status()?;
+            &format!("id=rootfs,if=none,format=raw,file={rootfs_path}"),
+            "-device",
+            "virtio-blk-device,drive=rootfs",
+        ]);
+    }
+    let status = cmd.status()?;
     Ok(status.success())
 }
 

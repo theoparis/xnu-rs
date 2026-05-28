@@ -59,6 +59,8 @@ pub unsafe extern "C" fn exception_lower_el_sync(frame: &mut TrapFrame) {
     } else {
         uart::write_str("xnu-rs: unexpected lower-EL sync exception EC=0x");
         uart::write_hex_u64(ec);
+        uart::write_str(" ESR=0x");
+        uart::write_hex_u64(esr);
         uart::write_str(" FAR=0x");
         let far: u64;
         // SAFETY: `FAR_EL1` is a read-only system register accessible at EL1.
@@ -68,6 +70,55 @@ pub unsafe extern "C" fn exception_lower_el_sync(frame: &mut TrapFrame) {
         uart::write_hex_u64(far);
         uart::write_str(" ELR=0x");
         uart::write_hex_u64(frame.pc);
+        uart::write_str("\n");
+        // Decode Data Abort details (EC=0x24 from lower EL, EC=0x25 from current EL).
+        if ec == 0x24 || ec == 0x25 {
+            let dfsc = esr & 0x3F;
+            let wnr = (esr >> 6) & 1;
+            uart::write_str("  ");
+            if wnr != 0 {
+                uart::write_str("WRITE");
+            } else {
+                uart::write_str("READ");
+            }
+            uart::write_str(" fault, DFSC=0x");
+            uart::write_hex_u64(dfsc);
+            uart::write_str(" (");
+            match dfsc {
+                0x04 => uart::write_str("translation L0"),
+                0x05 => uart::write_str("translation L1"),
+                0x06 => uart::write_str("translation L2"),
+                0x07 => uart::write_str("translation L3"),
+                0x09 => uart::write_str("access flag L1"),
+                0x0A => uart::write_str("access flag L2"),
+                0x0B => uart::write_str("access flag L3"),
+                0x0D => uart::write_str("permission L1"),
+                0x0E => uart::write_str("permission L2"),
+                0x0F => uart::write_str("permission L3"),
+                0x10 => uart::write_str("external sync"),
+                0x21 => uart::write_str("alignment"),
+                _ => uart::write_str("other"),
+            }
+            uart::write_str(")\n");
+        }
+        // Print registers
+        for i in 0..31 {
+            uart::write_str(" x");
+            // Simple decimal formatting for registers
+            if i < 10 {
+                uart::write_byte(b'0' + i as u8);
+            } else {
+                uart::write_byte(b'0' + (i / 10) as u8);
+                uart::write_byte(b'0' + (i % 10) as u8);
+            }
+            uart::write_str("=0x");
+            uart::write_hex_u64(frame.x[i]);
+            if i % 4 == 3 {
+                uart::write_str("\n");
+            }
+        }
+        uart::write_str("\n sp=0x");
+        uart::write_hex_u64(frame.sp);
         uart::write_str("\n");
         loop {
             core::hint::spin_loop();

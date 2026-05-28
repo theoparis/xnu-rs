@@ -9,7 +9,7 @@ PHDRS
 
 SECTIONS
 {
-  . = 0x40200000;
+  . = 0x48000000;
 
   .rodata : ALIGN(4K) {
     *(.rodata .rodata.*)

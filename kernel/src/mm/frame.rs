@@ -100,7 +100,9 @@ const fn frame_index(base: u64, pa: u64) -> usize {
         0
     } else {
         #[allow(clippy::cast_possible_truncation)]
-        { ((pa - base) / PAGE_SIZE) as usize }
+        {
+            ((pa - base) / PAGE_SIZE) as usize
+        }
     }
 }
 
@@ -109,7 +111,9 @@ const fn frame_index_ceil(base: u64, pa: u64) -> usize {
         0
     } else {
         #[allow(clippy::cast_possible_truncation)]
-        { ((pa - base).div_ceil(PAGE_SIZE)) as usize }
+        {
+            ((pa - base).div_ceil(PAGE_SIZE)) as usize
+        }
     }
 }
 

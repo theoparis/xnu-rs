@@ -95,10 +95,12 @@ struct PageTable([u64; TABLE_ENTRIES]);
 
 #[repr(C, align(4096))]
 struct KernelTables {
-    l1: PageTable,       // TTBR0 root: 1-GiB slots
-    l2_0gb: PageTable,   // L2 for 0x0000_0000 – 0x4000_0000 (MMIO)
-    l2_1gb: PageTable,   // L2 for 0x4000_0000 – 0x8000_0000 (RAM lo)
-    l2_2gb: PageTable,   // L2 for 0x8000_0000 – 0xC000_0000 (RAM hi)
+    l1: PageTable,          // TTBR0 root: 1-GiB slots
+    l2_0gb: PageTable,      // L2 for 0x0000_0000 – 0x4000_0000 (MMIO)
+    l2_1gb: PageTable,      // L2 for 0x4000_0000 – 0x8000_0000 (RAM lo)
+    l2_2gb: PageTable,      // L2 for 0x8000_0000 – 0xC000_0000 (RAM hi)
+    l2_commpage: PageTable, // L2 for 64th GiB (0x0000_000F_C000_0000 – 0x0000_000F_FFFF_FFFF)
+    l3_commpage: PageTable, // L3 for the commpage page
 }
 
 static mut KERNEL_TABLES: KernelTables = KernelTables {
@@ -106,7 +108,45 @@ static mut KERNEL_TABLES: KernelTables = KernelTables {
     l2_0gb: PageTable([0u64; TABLE_ENTRIES]),
     l2_1gb: PageTable([0u64; TABLE_ENTRIES]),
     l2_2gb: PageTable([0u64; TABLE_ENTRIES]),
+    l2_commpage: PageTable([0u64; TABLE_ENTRIES]),
+    l3_commpage: PageTable([0u64; TABLE_ENTRIES]),
 };
+
+#[repr(C, align(4096))]
+pub struct CommPage {
+    pub data: [u8; 65536],
+}
+
+pub static mut COMM_PAGE_DATA: CommPage = CommPage { data: [0u8; 65536] };
+
+/// Populate the shared commpage with system signature and layout version.
+///
+/// # Safety
+///
+/// Must be called during early boot when the environment is single-threaded
+/// and `COMM_PAGE_DATA` is not concurrently accessed.
+pub unsafe fn init_commpage() {
+    // SAFETY: Called early on a single thread. Using raw pointer to avoid static mut reference lints.
+    let cp = unsafe { &mut *core::ptr::addr_of_mut!(COMM_PAGE_DATA) };
+
+    // The signature and version are relative to _COMM_PAGE_START_ADDRESS = 0x0000000FFFFFC000.
+    // This address is offset 12 * 4096 = 0xC000 in our 64 KiB commpage.
+    let base_offset = 12 * 4096;
+
+    // Signature: "commpage 64-bit";
+    let sig = b"commpage 64-bit";
+    cp.data[base_offset..(base_offset + sig.len())].copy_from_slice(sig);
+
+    // _COMM_PAGE_VERSION (offset 0x01E) = 3 (u16)
+    let version = 3u16;
+    // SAFETY: Writing to a valid, initialized static structure using a raw pointer.
+    unsafe {
+        core::ptr::write_unaligned(
+            cp.data.as_mut_ptr().add(base_offset + 0x01e).cast::<u16>(),
+            version,
+        );
+    }
+}
 
 /// Initialise the kernel identity-map page tables and enable the MMU.
 ///
@@ -121,14 +161,23 @@ static mut KERNEL_TABLES: KernelTables = KernelTables {
 /// Must be called exactly once during early boot, before any TTBR0-dependent
 /// code.  The static `KERNEL_TABLES` must not be aliased elsewhere.
 pub unsafe fn init_kernel_tables() {
-    // SAFETY: Single-threaded early boot; no aliases.
     // SAFETY: Single-threaded early boot; no aliases. Using raw pointer to avoid
     // `deref_addrof` and `static_mut_refs` lints.
     let tables: &mut KernelTables = unsafe { &mut *core::ptr::addr_of_mut!(KERNEL_TABLES) };
 
-    // 2 MiB block descriptor base flags (Normal WB cacheable, AF, Inner Shareable)
-    let blk_normal = DESC_VALID | ATTR_IDX_NORMAL | ATTR_AP_RW_EL1 | ATTR_SH_INNER | ATTR_AF | ATTR_UXN;
-    let blk_device = DESC_VALID | ATTR_IDX_DEVICE | ATTR_AP_RW_EL1 | ATTR_SH_INNER | ATTR_AF | ATTR_UXN | ATTR_PXN;
+    // 2 MiB block descriptor base flags (Normal WB cacheable, AF, Inner Shareable).
+    // AP=EL0-RW: both EL1 and EL0 get R/W data access so user-space code (dyld,
+    // zsh) running in the identity map can read and write its own data sections.
+    // SCTLR_EL1.SPAN is set below so PAN is never auto-set on EL0→EL1 transitions.
+    let blk_normal_kernel = DESC_VALID | ATTR_IDX_NORMAL | ATTR_AP_RW_EL1 | ATTR_SH_INNER | ATTR_AF;
+    let blk_normal_user = DESC_VALID | ATTR_IDX_NORMAL | ATTR_AP_RW_EL0 | ATTR_SH_INNER | ATTR_AF;
+    let blk_device = DESC_VALID
+        | ATTR_IDX_DEVICE
+        | ATTR_AP_RW_EL1
+        | ATTR_SH_INNER
+        | ATTR_AF
+        | ATTR_UXN
+        | ATTR_PXN;
 
     // Map 0x0000_0000 – 0x4000_0000 as Device (MMIO lives here, e.g. UART 0x0900_0000)
     // 512 × 2 MiB = 1 GiB
@@ -137,16 +186,20 @@ pub unsafe fn init_kernel_tables() {
         tables.l2_0gb.0[i] = pa | blk_device;
     }
 
-    // Map 0x4000_0000 – 0x8000_0000 as Normal (RAM, kernel code)
+    // Map 0x4000_0000 – 0x8000_0000 as Normal (RAM, kernel code and user spaces)
     for i in 0..512usize {
         let pa = 0x4000_0000u64 + (i as u64) * (2 * 1024 * 1024);
-        tables.l2_1gb.0[i] = pa | blk_normal;
+        if pa < 0x4c20_0000 {
+            tables.l2_1gb.0[i] = pa | blk_normal_kernel;
+        } else {
+            tables.l2_1gb.0[i] = pa | blk_normal_user;
+        }
     }
 
     // Map 0x8000_0000 – 0xC000_0000 as Normal (more RAM)
     for i in 0..512usize {
         let pa = 0x8000_0000u64 + (i as u64) * (2 * 1024 * 1024);
-        tables.l2_2gb.0[i] = pa | blk_normal;
+        tables.l2_2gb.0[i] = pa | blk_normal_user;
     }
 
     // Wire L1 entries → L2 tables (table descriptors)
@@ -157,27 +210,60 @@ pub unsafe fn init_kernel_tables() {
     tables.l1.0[1] = l2_1_pa | DESC_VALID | DESC_TABLE;
     tables.l1.0[2] = l2_2_pa | DESC_VALID | DESC_TABLE;
 
+    // Wire L1 entry 63 → l2_commpage (table descriptor)
+    let l2_cp_pa = tables.l2_commpage.0.as_ptr() as u64;
+    tables.l1.0[63] = l2_cp_pa | DESC_VALID | DESC_TABLE;
+
+    // Wire L2 entry 511 → l3_commpage (table descriptor)
+    let l3_cp_pa = tables.l3_commpage.0.as_ptr() as u64;
+    tables.l2_commpage.0[511] = l3_cp_pa | DESC_VALID | DESC_TABLE;
+
+    // Wire L3 entries 496 to 511 → COMM_PAGE_DATA (page descriptors)
+    let cp_pa_base = core::ptr::addr_of!(COMM_PAGE_DATA) as u64;
+    for i in 0..16 {
+        let cp_pa = cp_pa_base + (i as u64) * 4096;
+        tables.l3_commpage.0[496 + i] = cp_pa
+            | DESC_VALID
+            | DESC_PAGE
+            | ATTR_IDX_NORMAL
+            | ATTR_AP_RO_EL0
+            | ATTR_SH_INNER
+            | ATTR_AF;
+    }
+
     let ttbr0 = tables.l1.0.as_ptr() as u64;
 
     // Enable the MMU.
     // SAFETY: Page tables are fully initialised above; all physical addresses
-    // used by the kernel are covered.  The ISB after each system-register write
-    // is required by the architecture before dependent instructions.
+    // used by the kernel are identity-mapped. ISBs synchronise system register
+    // writes before dependent operations.
     unsafe {
         core::arch::asm!(
-            // Programme memory attributes.
             "msr mair_el1, {mair}",
             "isb",
-            // Programme translation control.
             "msr tcr_el1, {tcr}",
             "isb",
-            // Load TTBR0 (identity map, ASID 0).
             "msr ttbr0_el1, {ttbr0}",
             "isb",
-            // Enable MMU: set SCTLR_EL1.M (bit 0) and C (bit 2, data cache enable).
+            // Enable MMU (M=1), data cache (C=1), instruction cache (I=1).
+            // Read-modify-write to preserve UEFI-set RES1 bits, but clear WXN
+            // (bit 19) which UEFI may have set; WXN would make all writable pages
+            // execute-never and immediately fault instruction fetch post-enable.
             "mrs {tmp}, sctlr_el1",
-            "orr {tmp}, {tmp}, #(1 << 0)",  // M
-            "orr {tmp}, {tmp}, #(1 << 2)",  // C
+            "bic {tmp}, {tmp}, #(1 << 19)", // WXN=0
+            // SPAN=1: suppress automatic PAN setting on EL0→EL1 exceptions so
+            // EL1 code can access AP=EL0-RW pages (identity-mapped user regions).
+            "orr {tmp}, {tmp}, #(1 << 23)", // SPAN=1
+            // Disable Pointer Authentication (EnIA/EnIB/EnDA/EnDB = 0) so
+            // arm64e AUTIA/AUTIB/AUTDA/AUTDB become identity (NOP) in EL0.
+            // This lets us run arm64e binaries without implementing PAC fixup signing.
+            "bic {tmp}, {tmp}, #(1 << 31)", // EnIA=0
+            "bic {tmp}, {tmp}, #(1 << 30)", // EnIB=0
+            "bic {tmp}, {tmp}, #(1 << 27)", // EnDA=0
+            "bic {tmp}, {tmp}, #(1 << 26)", // EnDB=0
+            "orr {tmp}, {tmp}, #(1 << 0)",  // M=1
+            "orr {tmp}, {tmp}, #(1 << 2)",  // C=1
+            "orr {tmp}, {tmp}, #(1 << 12)", // I=1
             "msr sctlr_el1, {tmp}",
             "isb",
             mair  = in(reg) MAIR_VALUE,

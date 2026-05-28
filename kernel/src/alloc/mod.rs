@@ -3,15 +3,17 @@ pub mod slab;
 
 use core::{
     alloc::{GlobalAlloc, Layout},
+    mem::MaybeUninit,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-const HEAP_SIZE: usize = 4 * 1024 * 1024;
+const HEAP_SIZE: usize = 64 * 1024 * 1024;
 
 #[repr(align(16))]
-struct Heap([u8; HEAP_SIZE]);
+struct Heap([MaybeUninit<u8>; HEAP_SIZE]);
 
-static HEAP: Heap = Heap([0; HEAP_SIZE]);
+// SAFETY: Zero-initialized via MaybeUninit; treated as raw bytes by the allocator.
+static mut HEAP: Heap = Heap([MaybeUninit::uninit(); HEAP_SIZE]);
 static HEAP_NEXT: AtomicUsize = AtomicUsize::new(0);
 
 struct BumpAllocator;
@@ -20,7 +22,8 @@ struct BumpAllocator;
 // All pointers returned are within `HEAP` and will not be freed.
 unsafe impl GlobalAlloc for BumpAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let base = HEAP.0.as_ptr() as usize;
+        // SAFETY: We only form a raw pointer to the array, never a reference.
+        let base = unsafe { core::ptr::addr_of!(HEAP.0) as usize };
         loop {
             let old = HEAP_NEXT.load(Ordering::Relaxed);
             let align = layout.align();
