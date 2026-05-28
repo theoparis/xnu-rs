@@ -20,7 +20,8 @@ impl Default for VmaList {
 }
 
 impl VmaList {
-    pub fn new() -> Self {
+    #[must_use]
+    pub const fn new() -> Self {
         Self(Vec::new())
     }
 
@@ -30,6 +31,7 @@ impl VmaList {
         self.0.sort_unstable_by_key(|v| v.start);
     }
 
+    #[must_use]
     pub fn find(&self, va: u64) -> Option<&Vma> {
         // Binary search for the last entry whose start ≤ va.
         let idx = self.0.partition_point(|v| v.start <= va);

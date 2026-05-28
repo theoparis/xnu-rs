@@ -1,7 +1,7 @@
 use crate::arch::aarch64::context::TrapFrame;
 
 /// Callee-saved register set for kernel-side context switches.
-/// Matches the AArch64 AAPCS64 callee-saved registers.
+/// Matches the `AArch64` AAPCS64 callee-saved registers.
 #[repr(C)]
 pub struct KernelContext {
     pub x19: u64,
@@ -65,7 +65,7 @@ pub struct Thread {
 impl Thread {
     /// Create a new user thread that will enter EL0 at `entry` with stack `user_sp`.
     #[must_use]
-    pub fn new_user(tid: u32, entry: u64, user_sp: u64, kernel_stack_top: u64) -> Self {
+    pub const fn new_user(tid: u32, entry: u64, user_sp: u64, kernel_stack_top: u64) -> Self {
         Self {
             tid,
             trap_frame: TrapFrame::new_user(entry, user_sp),
@@ -80,7 +80,7 @@ impl Thread {
     #[must_use]
     pub fn new_idle(tid: u32, kernel_stack_top: u64) -> Self {
         // The idle loop entry address — resolved at link time via a function pointer.
-        let lr = idle_loop as u64;
+        let lr = idle_loop as *const () as u64;
         let mut ctx = KernelContext::zeroed();
         ctx.lr = lr;
         ctx.sp = kernel_stack_top;

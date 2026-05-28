@@ -54,17 +54,19 @@ pub fn init(phys_base: u64, mem_size: u64, kernel_start: u64, kernel_end: u64) {
 
 /// Allocate one free 4 KiB physical frame.  Returns its physical address.
 pub fn alloc_frame() -> Option<u64> {
+    #[allow(clippy::cast_possible_truncation)]
     let count = FRAME_COUNT.load(Ordering::Relaxed) as usize;
-    let words = (count + 63) / 64;
-    for w in 0..words {
-        let mut val = BITMAP[w].load(Ordering::Relaxed);
+    let words = count.div_ceil(64);
+    for (w, bitmap_word) in BITMAP.iter().enumerate().take(words) {
+        let mut val = bitmap_word.load(Ordering::Relaxed);
         while val != 0 {
             let bit = val.trailing_zeros() as usize;
             let new_val = val & !(1u64 << bit);
-            match BITMAP[w].compare_exchange(val, new_val, Ordering::Acquire, Ordering::Relaxed) {
+            match bitmap_word.compare_exchange(val, new_val, Ordering::Acquire, Ordering::Relaxed) {
                 Ok(_) => {
                     let frame = w * 64 + bit;
                     if frame < count {
+                        #[allow(clippy::cast_possible_truncation)]
                         let pa = PHYS_BASE.load(Ordering::Relaxed) + (frame as u64) * PAGE_SIZE;
                         return Some(pa);
                     }
@@ -86,25 +88,28 @@ pub fn free_frame(pa: u64) {
         return;
     }
     let idx = ((pa - base) / PAGE_SIZE) as usize;
+    #[allow(clippy::cast_possible_truncation)]
     let count = FRAME_COUNT.load(Ordering::Relaxed) as usize;
     if idx < count {
         set_bit(idx, true);
     }
 }
 
-fn frame_index(base: u64, pa: u64) -> usize {
+const fn frame_index(base: u64, pa: u64) -> usize {
     if pa <= base {
         0
     } else {
-        ((pa - base) / PAGE_SIZE) as usize
+        #[allow(clippy::cast_possible_truncation)]
+        { ((pa - base) / PAGE_SIZE) as usize }
     }
 }
 
-fn frame_index_ceil(base: u64, pa: u64) -> usize {
+const fn frame_index_ceil(base: u64, pa: u64) -> usize {
     if pa <= base {
         0
     } else {
-        (((pa - base) + PAGE_SIZE - 1) / PAGE_SIZE) as usize
+        #[allow(clippy::cast_possible_truncation)]
+        { ((pa - base).div_ceil(PAGE_SIZE)) as usize }
     }
 }
 

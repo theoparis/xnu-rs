@@ -47,6 +47,7 @@ pub fn register_task(task: Arc<Task>) {
 
 /// Return the PID of the currently running thread by reading the `Thread`
 /// pointer from `TPIDR_EL1`.  Returns `0` when no thread has been scheduled.
+#[must_use]
 pub fn current_pid() -> u32 {
     let ptr = super::runqueue::current_thread_ptr();
     if ptr.is_null() {
