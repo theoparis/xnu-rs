@@ -11,7 +11,8 @@
 ///
 /// Must be the very first thing called in `_start`, before any code that
 /// reads or writes EL1 system registers.
-pub unsafe fn drop_to_el1_if_needed() {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drop_to_el1_if_needed() {
     // `CurrentEL` bits [3:2] encode the current exception level.
     let current_el: u64;
     // SAFETY: `CurrentEL` is a read-only architectural register.

@@ -8,7 +8,9 @@ mod device_tree;
 
 use boot_args::BootArgs;
 use core::{panic::PanicInfo, ptr, slice};
-use kernel::arch::aarch64::{boot, uart};
+use kernel::arch::aarch64::{boot, gic, mmu, smp, uart};
+use kernel::mm;
+use kernel::sched;
 
 const BOOT_ARGS_REVISION2: u16 = 2;
 const BOOT_ARGS_VERSION2: u16 = 2;
@@ -29,6 +31,20 @@ pub extern "C" fn _start(boot_args: *const BootArgs) -> ! {
     uart::write_str("xnu-rs: entered kernel _start\n");
     let args = validate_boot_args(boot_args);
 
+    // Initialise the physical frame allocator.
+    // Use phys_base/mem_size from boot args when available; fall back to
+    // conservative defaults that cover QEMU virt RAM at 0x40000000 (256 MiB).
+    let (phys_base, mem_size, kernel_end) = args.map_or(
+        (0x4000_0000u64, 256 * 1024 * 1024u64, 0x4020_0000u64 + 4 * 1024 * 1024),
+        |a| (a.phys_base, a.mem_size, a.top_of_kernel_data),
+    );
+    mm::frame::init(phys_base, mem_size, 0x4020_0000, kernel_end);
+
+    // Enable the MMU with a TTBR0 identity map covering all RAM and MMIO.
+    // SAFETY: Frame allocator is initialised; page tables are static BSS.
+    unsafe { mmu::init_kernel_tables() };
+    uart::write_str("xnu-rs: mmu enabled\n");
+
     // Compute load address for the test user binary: just past kernel data.
     let load_base = args.map_or_else(
         || align_up_2m(0x4000_0000 + 64 * 1024 * 1024),
@@ -38,6 +54,26 @@ pub extern "C" fn _start(boot_args: *const BootArgs) -> ! {
     uart::write_str("xnu-rs: launching test user binary at load_base=0x");
     uart::write_hex_u64(load_base);
     uart::write_str("\n");
+
+    // Initialise the cooperative scheduler and task table.
+    sched::init_runqueue();
+    sched::init_task_table();
+    uart::write_str("xnu-rs: scheduler init\n");
+
+    // Initialize GIC distributor (CPU0 only).
+    // SAFETY: Single-core early boot; no secondary CPUs running yet.
+    unsafe { gic::init_distributor() };
+    // Initialize GIC CPU interface for CPU0.
+    // SAFETY: Called once during CPU0 bring-up.
+    unsafe { gic::init_cpu_interface() };
+    uart::write_str("xnu-rs: gic init\n");
+
+    // Initialize virtio-blk driver.
+    kernel::drivers::virtio::init_blk();
+
+    // Boot secondary CPUs via PSCI.
+    // SAFETY: GIC distributor is initialized; called from CPU0.
+    unsafe { smp::boot_secondaries(4) };
 
     // SAFETY: `load_base` is aligned, past the kernel, and in valid RAM.
     // The exception vectors will be installed inside `load_and_run`.

@@ -1,6 +1,7 @@
 use core::arch::global_asm;
 
 use super::context::TrapFrame;
+use super::gic;
 use super::syscall;
 use super::uart;
 
@@ -90,22 +91,16 @@ pub extern "C" fn exception_el1_sync(frame: &TrapFrame) {
     }
 }
 
-/// IRQ from current EL — not yet handled.
+/// IRQ from current EL — dispatch via GIC.
 #[unsafe(no_mangle)]
 pub extern "C" fn exception_el1_irq(_frame: &TrapFrame) {
-    uart::write_str("xnu-rs: unhandled EL1 IRQ\n");
-    loop {
-        core::hint::spin_loop();
-    }
+    gic::handle_irq();
 }
 
-/// Unhandled lower-EL IRQ.
+/// IRQ from lower EL — dispatch via GIC.
 #[unsafe(no_mangle)]
 pub extern "C" fn exception_lower_el_irq(_frame: &TrapFrame) {
-    uart::write_str("xnu-rs: unhandled lower-EL IRQ\n");
-    loop {
-        core::hint::spin_loop();
-    }
+    gic::handle_irq();
 }
 
 // ---------------------------------------------------------------------------
