@@ -1,0 +1,10 @@
+[alias]
+xtask = "run --package xtask --"
+
+[target.aarch64-unknown-none]
+linker = "rust-lld"
+rustflags = ["-C", "link-arg=-Tkernel/linker/aarch64.ld", "-Zthreads=0",  "-Zshare-generics=y"]
+
+[target.aarch64-apple-darwin]
+linker = "rust-lld"
+rustflags = ["-Zthreads=0",  "-Zshare-generics=y"]

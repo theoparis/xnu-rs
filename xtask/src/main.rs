@@ -1,0 +1,613 @@
+use std::{
+    env, fs, io,
+    path::{Path, PathBuf},
+    process::{Command, ExitCode},
+};
+
+use fatfs::{FatType, FileSystem, FormatVolumeOptions, FsOptions, format_volume};
+use goblin::{
+    elf::{Elf, program_header::PT_LOAD},
+    mach::{
+        constants::{VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE, cputype},
+        header::{MH_EXECUTE, MH_MAGIC_64},
+        load_command::{
+            LC_MAIN, LC_SEGMENT_64, SIZEOF_ENTRY_POINT_COMMAND, SIZEOF_SEGMENT_COMMAND_64,
+        },
+    },
+};
+use gpt::{GptConfig, disk::LogicalBlockSize, mbr::ProtectiveMBR, partition_types};
+
+const TARGET: &str = "aarch64-unknown-none";
+const UEFI_TARGET: &str = "aarch64-unknown-uefi";
+const KERNEL_NAME: &str = "kernel";
+const LOADER_NAME: &str = "loader";
+const IMAGE_SIZE: u64 = 256 * 1024 * 1024;
+const ESP_PARTITION_SIZE: u64 = 224 * 1024 * 1024;
+const QEMU_FIRMWARE_ENV: &str = "QEMU_EFI_FD";
+
+fn main() -> ExitCode {
+    let mut args = env::args().skip(1);
+    let Some(cmd) = args.next() else {
+        eprintln!("usage: cargo xtask <check|clippy|fmt|build-image|run>");
+        return ExitCode::from(2);
+    };
+
+    let status = match cmd.as_str() {
+        "check" => check(),
+        "clippy" => clippy(),
+        "fmt" => cargo(&["fmt", "--all", "--", "--check"]),
+        "build-image" => build_image(),
+        "run" | "qemu" => run_qemu(),
+        _ => {
+            eprintln!("unknown command: {cmd}");
+            eprintln!("usage: cargo xtask <check|clippy|fmt|build-image|run>");
+            return ExitCode::from(2);
+        }
+    };
+
+    match status {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::from(1),
+        Err(err) => {
+            eprintln!("{err}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn cargo(args: &[&str]) -> io::Result<bool> {
+    Command::new("cargo")
+        .args(args)
+        .status()
+        .map(|status| status.success())
+}
+
+fn cargo_many(runs: &[&[&str]]) -> io::Result<bool> {
+    for args in runs {
+        if !cargo(args)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn check() -> io::Result<bool> {
+    cargo_many(&[
+        &["check", "-p", KERNEL_NAME, "--target", TARGET],
+        &["check", "-p", LOADER_NAME, "--target", UEFI_TARGET],
+        &["check", "-p", "xtask"],
+    ])
+}
+
+fn clippy() -> io::Result<bool> {
+    cargo_many(&[
+        &[
+            "clippy",
+            "-p",
+            KERNEL_NAME,
+            "--target",
+            TARGET,
+            "--",
+            "-D",
+            "warnings",
+        ],
+        &[
+            "clippy",
+            "-p",
+            LOADER_NAME,
+            "--target",
+            UEFI_TARGET,
+            "--",
+            "-D",
+            "warnings",
+        ],
+        &["clippy", "-p", "xtask", "--", "-D", "warnings"],
+    ])
+}
+
+fn build_image() -> io::Result<bool> {
+    if !cargo(&["build", "-p", LOADER_NAME, "--target", UEFI_TARGET])? {
+        return Ok(false);
+    }
+    if !cargo(&["build", "-p", KERNEL_NAME, "--target", TARGET])? {
+        return Ok(false);
+    }
+
+    let out_dir = PathBuf::from("target/qemu");
+    let bundle_dir = out_dir.join("bundle");
+    let esp_dir = out_dir.join("esp");
+    let images_dir = out_dir.join("images");
+    fs::create_dir_all(bundle_dir.join("EFI/BOOT"))?;
+    fs::create_dir_all(&esp_dir)?;
+    fs::create_dir_all(&images_dir)?;
+
+    let kernel_elf = PathBuf::from("target")
+        .join(TARGET)
+        .join("debug")
+        .join(KERNEL_NAME);
+    let kernel_macho = bundle_dir.join("kernel.macho");
+    let loader_efi = discover_efi_artifact(LOADER_NAME)?;
+
+    fs::copy(&kernel_elf, bundle_dir.join("kernel.elf"))?;
+    convert_elf_to_macho(&kernel_elf, &kernel_macho)?;
+    fs::copy(&loader_efi, bundle_dir.join("EFI/BOOT/BOOTAA64.EFI"))?;
+
+    let manifest = format!(
+        concat!(
+            "kernel = \"kernel.macho\"\n",
+            "loader = \"EFI/BOOT/BOOTAA64.EFI\"\n",
+            "target = \"{TARGET}\"\n",
+            "boot = \"UEFI\"\n",
+            "debugging = [\"radare2\", \"r2ghidra\"]\n"
+        ),
+        TARGET = TARGET,
+    );
+    fs::write(bundle_dir.join("MANIFEST.toml"), manifest)?;
+
+    let esp_img = images_dir.join("esp.img");
+    build_uefi_disk_image(&esp_img, &loader_efi, &kernel_macho)?;
+
+    println!("image bundle: {}", bundle_dir.display());
+    println!("ESP image: {}", esp_img.display());
+    Ok(true)
+}
+
+fn build_uefi_disk_image(
+    image_path: &Path,
+    loader_efi: &Path,
+    kernel_macho: &Path,
+) -> io::Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(image_path)?;
+    file.set_len(IMAGE_SIZE)?;
+
+    ProtectiveMBR::with_lb_size(
+        u32::try_from((IMAGE_SIZE / 512).saturating_sub(1))
+            .map_err(|_| io::Error::other("image too large for protective MBR"))?,
+    )
+    .overwrite_lba0(&mut file)
+    .map_err(gpt_error)?;
+
+    let mut disk = GptConfig::default()
+        .writable(true)
+        .logical_block_size(LogicalBlockSize::Lb512)
+        .create_from_device(file, None)
+        .map_err(gpt_error)?;
+
+    let part_id = disk
+        .add_partition("ESP", ESP_PARTITION_SIZE, partition_types::EFI, 0, None)
+        .map_err(gpt_error)?;
+    let partition = disk
+        .partitions()
+        .get(&part_id)
+        .cloned()
+        .ok_or_else(|| io::Error::other("missing GPT partition after creation"))?;
+
+    disk.write_inplace().map_err(gpt_error)?;
+    let file = disk.write().map_err(gpt_error)?;
+
+    let start = partition
+        .bytes_start(LogicalBlockSize::Lb512)
+        .map_err(gpt_error)?;
+    let len = partition
+        .bytes_len(LogicalBlockSize::Lb512)
+        .map_err(gpt_error)?;
+    let mut partition_io = PartitionIo::new(file, start, len);
+
+    format_volume(
+        &mut partition_io,
+        FormatVolumeOptions::new().fat_type(FatType::Fat32),
+    )?;
+
+    let fs = FileSystem::new(partition_io, FsOptions::new())?;
+    populate_esp(&fs, loader_efi, kernel_macho)?;
+    fs.unmount()?;
+
+    Ok(())
+}
+
+fn populate_esp<T: io::Read + io::Write + io::Seek>(
+    fs: &FileSystem<T>,
+    loader_efi: &Path,
+    kernel_macho: &Path,
+) -> io::Result<()> {
+    let root = fs.root_dir();
+    root.create_dir("EFI")?;
+    root.create_dir("EFI/BOOT")?;
+
+    copy_into_fat_file(loader_efi, &mut root.create_file("EFI/BOOT/BOOTAA64.EFI")?)?;
+    copy_into_fat_file(kernel_macho, &mut root.create_file("KERNEL")?)?;
+
+    let mut startup = root.create_file("STARTUP.NSH")?;
+
+    let command = "\\EFI\\BOOT\\BOOTAA64.EFI\r\n";
+    let mut script_bytes: Vec<u8> = Vec::new();
+
+    script_bytes.push(0xFF);
+    script_bytes.push(0xFE);
+
+    for c in command.encode_utf16() {
+        script_bytes.extend_from_slice(&c.to_le_bytes());
+    }
+
+    io::Write::write_all(&mut startup, &script_bytes)?;
+
+    Ok(())
+}
+
+fn copy_into_fat_file(src: &Path, dst: &mut impl io::Write) -> io::Result<u64> {
+    let mut src_file = fs::File::open(src)?;
+    io::copy(&mut src_file, dst)
+}
+
+fn gpt_error<E: std::fmt::Display>(err: E) -> io::Error {
+    io::Error::other(err.to_string())
+}
+
+fn convert_elf_to_macho(src: &Path, dst: &Path) -> io::Result<()> {
+    let elf_bytes = fs::read(src)?;
+    let elf = Elf::parse(&elf_bytes).map_err(|err| io::Error::other(err.to_string()))?;
+
+    let loadable: Vec<_> = elf
+        .program_headers
+        .iter()
+        .filter(|header| header.p_type == PT_LOAD && header.p_memsz != 0)
+        .collect();
+    if loadable.is_empty() {
+        return Err(io::Error::other("ELF image has no PT_LOAD segments"));
+    }
+
+    let sizeofcmds = loadable
+        .len()
+        .checked_mul(SIZEOF_SEGMENT_COMMAND_64)
+        .and_then(|size| size.checked_add(SIZEOF_ENTRY_POINT_COMMAND))
+        .ok_or_else(|| io::Error::other("Mach-O command size overflow"))?;
+    let header_size = 32usize;
+    let mut file_offset = align_usize(header_size + sizeofcmds, 0x1000)?;
+
+    let mut layout = Vec::with_capacity(loadable.len());
+    let mut text_base = None;
+    for (index, header) in loadable.iter().enumerate() {
+        file_offset = align_usize(file_offset, 0x1000)?;
+        let segname = segment_name(index, header.p_flags);
+        if segname == *b"__TEXT\0\0\0\0\0\0\0\0\0\0" {
+            text_base = Some((header.p_vaddr, file_offset as u64));
+        }
+
+        layout.push(MachSegmentLayout {
+            segname,
+            vmaddr: header.p_vaddr,
+            vmsize: header.p_memsz,
+            fileoff: file_offset as u64,
+            filesize: header.p_filesz,
+            initprot: vm_prot(header.p_flags),
+            maxprot: vm_prot(header.p_flags),
+            source_offset: usize::try_from(header.p_offset)
+                .map_err(|_| io::Error::other("ELF offset overflow"))?,
+        });
+
+        let file_size = usize::try_from(header.p_filesz)
+            .map_err(|_| io::Error::other("ELF file size overflow"))?;
+        file_offset = file_offset
+            .checked_add(file_size)
+            .ok_or_else(|| io::Error::other("Mach-O file size overflow"))?;
+    }
+
+    let (text_vmaddr, text_fileoff) =
+        text_base.ok_or_else(|| io::Error::other("ELF image has no executable text segment"))?;
+    let entryoff = elf
+        .entry
+        .checked_sub(text_vmaddr.saturating_sub(text_fileoff))
+        .ok_or_else(|| io::Error::other("invalid ELF entry for Mach-O conversion"))?;
+
+    let final_size = file_offset;
+    let mut macho = vec![0_u8; final_size];
+    let mut cursor = 0usize;
+
+    write_u32(&mut macho, &mut cursor, MH_MAGIC_64);
+    write_u32(&mut macho, &mut cursor, cputype::CPU_TYPE_ARM64);
+    write_u32(&mut macho, &mut cursor, cputype::CPU_SUBTYPE_ARM64_ALL);
+    write_u32(&mut macho, &mut cursor, MH_EXECUTE);
+    write_u32(
+        &mut macho,
+        &mut cursor,
+        u32::try_from(layout.len() + 1)
+            .map_err(|_| io::Error::other("too many Mach-O commands"))?,
+    );
+    write_u32(
+        &mut macho,
+        &mut cursor,
+        u32::try_from(sizeofcmds).map_err(|_| io::Error::other("Mach-O commands too large"))?,
+    );
+    write_u32(&mut macho, &mut cursor, 0x1);
+    write_u32(&mut macho, &mut cursor, 0);
+
+    for segment in &layout {
+        write_u32(&mut macho, &mut cursor, LC_SEGMENT_64);
+        write_u32(
+            &mut macho,
+            &mut cursor,
+            u32::try_from(SIZEOF_SEGMENT_COMMAND_64)
+                .map_err(|_| io::Error::other("bad segment command size"))?,
+        );
+        macho[cursor..cursor + 16].copy_from_slice(&segment.segname);
+        cursor += 16;
+        write_u64(&mut macho, &mut cursor, segment.vmaddr);
+        write_u64(&mut macho, &mut cursor, segment.vmsize);
+        write_u64(&mut macho, &mut cursor, segment.fileoff);
+        write_u64(&mut macho, &mut cursor, segment.filesize);
+        write_u32(&mut macho, &mut cursor, segment.maxprot);
+        write_u32(&mut macho, &mut cursor, segment.initprot);
+        write_u32(&mut macho, &mut cursor, 0);
+        write_u32(&mut macho, &mut cursor, 0);
+    }
+
+    write_u32(&mut macho, &mut cursor, LC_MAIN);
+    write_u32(
+        &mut macho,
+        &mut cursor,
+        u32::try_from(SIZEOF_ENTRY_POINT_COMMAND)
+            .map_err(|_| io::Error::other("bad entry command size"))?,
+    );
+    write_u64(&mut macho, &mut cursor, entryoff);
+    write_u64(&mut macho, &mut cursor, 0);
+
+    for segment in &layout {
+        let src_start = segment.source_offset;
+        let src_end = src_start
+            .checked_add(
+                usize::try_from(segment.filesize)
+                    .map_err(|_| io::Error::other("Mach-O segment file size overflow"))?,
+            )
+            .ok_or_else(|| io::Error::other("Mach-O segment range overflow"))?;
+        let dst_start = usize::try_from(segment.fileoff)
+            .map_err(|_| io::Error::other("Mach-O file offset overflow"))?;
+        let dst_end = dst_start
+            .checked_add(src_end - src_start)
+            .ok_or_else(|| io::Error::other("Mach-O output range overflow"))?;
+        macho[dst_start..dst_end].copy_from_slice(&elf_bytes[src_start..src_end]);
+    }
+
+    fs::write(dst, macho)
+}
+
+fn segment_name(index: usize, flags: u32) -> [u8; 16] {
+    const TEXT: [u8; 16] = *b"__TEXT\0\0\0\0\0\0\0\0\0\0";
+    const DATA: [u8; 16] = *b"__DATA\0\0\0\0\0\0\0\0\0\0";
+    if flags & 0x1 != 0 {
+        TEXT
+    } else if flags & 0x2 != 0 {
+        DATA
+    } else {
+        let mut name = [0_u8; 16];
+        let label = format!("__SEG{index}");
+        let bytes = label.as_bytes();
+        name[..bytes.len().min(16)].copy_from_slice(&bytes[..bytes.len().min(16)]);
+        name
+    }
+}
+
+const fn vm_prot(flags: u32) -> u32 {
+    let mut prot = 0;
+    if flags & 0x4 != 0 {
+        prot |= VM_PROT_READ;
+    }
+    if flags & 0x2 != 0 {
+        prot |= VM_PROT_WRITE;
+    }
+    if flags & 0x1 != 0 {
+        prot |= VM_PROT_EXECUTE;
+    }
+    prot
+}
+
+fn align_usize(value: usize, align: usize) -> io::Result<usize> {
+    value
+        .checked_add(align - 1)
+        .map(|value| value & !(align - 1))
+        .ok_or_else(|| io::Error::other("alignment overflow"))
+}
+
+fn write_u32(buf: &mut [u8], cursor: &mut usize, value: u32) {
+    buf[*cursor..*cursor + 4].copy_from_slice(&value.to_le_bytes());
+    *cursor += 4;
+}
+
+fn write_u64(buf: &mut [u8], cursor: &mut usize, value: u64) {
+    buf[*cursor..*cursor + 8].copy_from_slice(&value.to_le_bytes());
+    *cursor += 8;
+}
+
+fn discover_efi_artifact(name: &str) -> io::Result<PathBuf> {
+    let deps_dir = PathBuf::from("target")
+        .join(UEFI_TARGET)
+        .join("debug")
+        .join("deps");
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+
+    for entry in fs::read_dir(&deps_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let is_efi = path.extension().and_then(|ext| ext.to_str()) == Some("efi");
+        let matches_name = path
+            .file_name()
+            .and_then(|file| file.to_str())
+            .is_some_and(|file| file.starts_with(name) || file.contains(&format!("{name}-")));
+        if !(is_efi && matches_name) {
+            continue;
+        }
+
+        let modified = entry
+            .metadata()?
+            .modified()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let replace = best
+            .as_ref()
+            .is_none_or(|(best_time, _)| modified > *best_time);
+        if replace {
+            best = Some((modified, path));
+        }
+    }
+
+    best.map(|(_, path)| path).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("could not locate {name}.efi in {}", deps_dir.display()),
+        )
+    })
+}
+
+fn qemu_firmware_path() -> io::Result<PathBuf> {
+    if let Ok(path) = env::var(QEMU_FIRMWARE_ENV) {
+        return Ok(PathBuf::from(path));
+    }
+
+    for candidate in [
+        "/usr/share/edk2/aarch64/QEMU_EFI.fd",
+        "/usr/share/qemu-efi-aarch64/QEMU_EFI.fd",
+        "/usr/share/OVMF/OVMF_CODE.fd",
+        "/opt/homebrew/opt/qemu/share/qemu/edk2-aarch64-code.fd",
+    ] {
+        let path = PathBuf::from(candidate);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "UEFI firmware not found; set QEMU_EFI_FD",
+    ))
+}
+
+fn run_qemu() -> io::Result<bool> {
+    let _ = build_image()?;
+    let firmware = qemu_firmware_path()?;
+    let status = Command::new("qemu-system-aarch64")
+        .args([
+            "-M",
+            "virt,virtualization=on",
+            "-accel",
+            "tcg,thread=multi",
+            "-cpu",
+            "cortex-a72",
+            "-m",
+            "1024M",
+            "-nographic",
+            "-serial",
+            "mon:stdio",
+            "-bios",
+        ])
+        .arg(firmware)
+        .args([
+            "-drive",
+            "if=virtio,format=raw,file=target/qemu/images/esp.img",
+        ])
+        .status()?;
+    Ok(status.success())
+}
+
+struct MachSegmentLayout {
+    segname: [u8; 16],
+    vmaddr: u64,
+    vmsize: u64,
+    fileoff: u64,
+    filesize: u64,
+    maxprot: u32,
+    initprot: u32,
+    source_offset: usize,
+}
+
+struct PartitionIo<T> {
+    inner: T,
+    base: u64,
+    len: u64,
+    pos: u64,
+}
+
+impl<T> PartitionIo<T> {
+    const fn new(inner: T, base: u64, len: u64) -> Self {
+        Self {
+            inner,
+            base,
+            len,
+            pos: 0,
+        }
+    }
+}
+
+impl<T: io::Read + io::Write + io::Seek> io::Read for PartitionIo<T> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.pos >= self.len {
+            return Ok(0);
+        }
+
+        let remaining = self.len - self.pos;
+        let max = u64::try_from(buf.len()).map_err(|_| io::Error::other("buffer too large"))?;
+        let count =
+            usize::try_from(remaining.min(max)).map_err(|_| io::Error::other("read overflow"))?;
+        self.inner.seek(io::SeekFrom::Start(self.base + self.pos))?;
+        let read = self.inner.read(&mut buf[..count])?;
+        self.pos += u64::try_from(read).map_err(|_| io::Error::other("read overflow"))?;
+        Ok(read)
+    }
+}
+
+impl<T: io::Read + io::Write + io::Seek> io::Write for PartitionIo<T> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.pos >= self.len {
+            return Ok(0);
+        }
+
+        let remaining = self.len - self.pos;
+        let max = u64::try_from(buf.len()).map_err(|_| io::Error::other("buffer too large"))?;
+        let count =
+            usize::try_from(remaining.min(max)).map_err(|_| io::Error::other("write overflow"))?;
+        self.inner.seek(io::SeekFrom::Start(self.base + self.pos))?;
+        let written = self.inner.write(&buf[..count])?;
+        self.pos += u64::try_from(written).map_err(|_| io::Error::other("write overflow"))?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<T: io::Read + io::Write + io::Seek> io::Seek for PartitionIo<T> {
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        let next = match pos {
+            io::SeekFrom::Start(off) => off,
+            io::SeekFrom::Current(delta) => if delta >= 0 {
+                self.pos.checked_add(
+                    u64::try_from(delta).map_err(|_| io::Error::other("seek overflow"))?,
+                )
+            } else {
+                self.pos.checked_sub(delta.unsigned_abs())
+            }
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "seek outside partition"))?,
+            io::SeekFrom::End(delta) => if delta >= 0 {
+                self.len.checked_add(
+                    u64::try_from(delta).map_err(|_| io::Error::other("seek overflow"))?,
+                )
+            } else {
+                self.len.checked_sub(delta.unsigned_abs())
+            }
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "seek outside partition"))?,
+        };
+
+        if next > self.len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek outside partition",
+            ));
+        }
+
+        self.pos = next;
+        Ok(self.pos)
+    }
+}

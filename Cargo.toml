@@ -1,0 +1,49 @@
+[workspace]
+members = ["kernel", "loader", "xtask"]
+resolver = "3"
+
+[workspace.dependencies]
+log = "0.4.30"
+spin = "0.12.0"
+goblin = { version = "0.10.6", default-features = false, features = ["alloc", "elf32", "elf64", "mach32", "mach64"] }
+arm-gic = "0.8.1"
+aarch64-cpu = "11.2.0"
+aarch64-paging = { version = "0.12.1", default-features = false, features = ["alloc"] }
+uefi = "0.37.0"
+gpt = "4.1.0"
+fatfs = { version = "0.3.6", default-features = false, features = ["std"] }
+
+[workspace.lints.rust]
+elided_lifetimes_in_paths = "deny"
+unused_must_use = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+unreachable_pub = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+dbg_macro = "deny"
+todo = "deny"
+undocumented_unsafe_blocks = "warn"
+redundant_pub_crate = "warn"
+missing_panics_doc = "warn"
+missing_errors_doc = "warn"
+
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev]
+opt-level = 1
+split-debuginfo = "packed"
+lto = "thin"
+panic = "abort"
+
+[profile.release]
+opt-level = 3
+split-debuginfo = "packed"
+lto = "thin"
+panic = "abort"
