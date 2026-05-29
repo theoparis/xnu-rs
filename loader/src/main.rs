@@ -15,8 +15,7 @@ use core::{
 };
 
 use boot_args::BootArgs;
-use goblin::mach::MachO;
-use loader::MachOImage;
+use loader::MachO;
 use uefi::{
     boot::{self, AllocateType, MemoryType, PAGE_SIZE},
     cstr16, entry,
@@ -49,9 +48,7 @@ fn load_and_jump_to_kernel() -> Result<Infallible, Status> {
         "loader: parsing kernel Mach-O ({} bytes)",
         kernel_bytes.len()
     );
-    let macho = MachOImage::new(&kernel_bytes)
-        .parse()
-        .map_err(|_| Status::LOAD_ERROR)?;
+    let macho = MachO::parse(&kernel_bytes).map_err(|_| Status::LOAD_ERROR)?;
 
     allocate_load_ranges(&macho)?;
     load_segments(&macho)?;
@@ -64,7 +61,8 @@ fn load_and_jump_to_kernel() -> Result<Infallible, Status> {
 
     println!(
         "loader: prepared kernel entry {:#x}, stack {:#x}; exiting boot services",
-        macho.entry, stack_top
+        macho.entry(),
+        stack_top
     );
     // SAFETY: We intentionally exit boot services after all protocol/file allocations are done.
     let memory_map = unsafe { boot::exit_boot_services(None) };
@@ -74,7 +72,7 @@ fn load_and_jump_to_kernel() -> Result<Infallible, Status> {
     // memory. Do not return through the UEFI entry wrapper; branch directly to the kernel.
     unsafe {
         jump_to_entry(KernelHandOff {
-            entry: macho.entry,
+            entry: macho.entry(),
             boot_args: boot_args_ptr.cast_const(),
             stack_top,
         });
@@ -118,16 +116,17 @@ fn allocate_load_ranges(macho: &MachO<'_>) -> Result<(), Status> {
 fn load_ranges(macho: &MachO<'_>) -> Result<Vec<LoadRange>, Status> {
     let mut ranges = Vec::new();
 
-    for segment in &macho.segments {
-        if segment.vmsize == 0 {
+    for segment in macho.segments() {
+        let vmsize = segment.vmsize();
+        if vmsize == 0 {
             continue;
         }
 
-        let start = align_down(segment.vmaddr, PAGE_SIZE as u64);
+        let start = align_down(segment.vmaddr(), PAGE_SIZE as u64);
         let end = align_up(
             segment
-                .vmaddr
-                .checked_add(segment.vmsize)
+                .vmaddr()
+                .checked_add(vmsize)
                 .ok_or(Status::LOAD_ERROR)?,
             PAGE_SIZE as u64,
         )?;
@@ -138,27 +137,29 @@ fn load_ranges(macho: &MachO<'_>) -> Result<Vec<LoadRange>, Status> {
 }
 
 fn load_segments(macho: &MachO<'_>) -> Result<(), Status> {
-    for segment in &macho.segments {
-        if segment.filesize == 0 {
+    for segment in macho.segments() {
+        if segment.filesize() == 0 {
             continue;
         }
 
-        let dst = usize::try_from(segment.vmaddr).map_err(|_| Status::LOAD_ERROR)? as *mut u8;
+        let data = segment.data().map_err(|_| Status::LOAD_ERROR)?;
+        let dst = usize::try_from(segment.vmaddr()).map_err(|_| Status::LOAD_ERROR)? as *mut u8;
         // SAFETY: The destination virtual address lies within the pages allocated from the
-        // Mach-O segment ranges, and `segment.data` points to the segment bytes in the file.
-        unsafe { copy_nonoverlapping(segment.data.as_ptr(), dst, segment.data.len()) };
+        // Mach-O segment ranges, and `data` points to the segment bytes in the file.
+        unsafe { copy_nonoverlapping(data.as_ptr(), dst, data.len()) };
     }
 
     Ok(())
 }
 
 fn sync_loaded_image(macho: &MachO<'_>) -> Result<(), Status> {
-    for segment in &macho.segments {
-        if segment.vmsize == 0 {
+    for segment in macho.segments() {
+        let vmsize = segment.vmsize();
+        if vmsize == 0 {
             continue;
         }
-        let start = segment.vmaddr;
-        let len = usize::try_from(segment.vmsize).map_err(|_| Status::LOAD_ERROR)?;
+        let start = segment.vmaddr();
+        let len = usize::try_from(vmsize).map_err(|_| Status::LOAD_ERROR)?;
         // SAFETY: The loader just copied/zeroed the loaded image into this memory range.
         unsafe { clean_dcache_invalidate_icache(start, len) };
     }
@@ -192,10 +193,10 @@ unsafe fn clean_dcache_invalidate_icache(start: u64, len: usize) {
 
 fn kernel_top(macho: &MachO<'_>) -> Result<u64, Status> {
     let mut top = 0_u64;
-    for segment in &macho.segments {
+    for segment in macho.segments() {
         let end = segment
-            .vmaddr
-            .checked_add(segment.vmsize)
+            .vmaddr()
+            .checked_add(segment.vmsize())
             .ok_or(Status::LOAD_ERROR)?;
         if end > top {
             top = end;

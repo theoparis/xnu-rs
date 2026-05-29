@@ -11,7 +11,7 @@ workspace = true
 [dependencies]
 log.workspace = true
 spin.workspace = true
-goblin.workspace = true
+object.workspace = true
 aarch64-cpu.workspace = true
 aarch64-paging.workspace = true
 arm-gic.workspace = true

@@ -6,17 +6,16 @@ use std::{
 };
 
 use fatfs::{FatType, FileSystem, FormatVolumeOptions, FsOptions, format_volume};
-use goblin::{
-    elf::{Elf, program_header::PT_LOAD},
-    mach::{
-        constants::{VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE, cputype},
-        header::{MH_EXECUTE, MH_MAGIC_64},
-        load_command::{
-            LC_MAIN, LC_SEGMENT_64, SIZEOF_ENTRY_POINT_COMMAND, SIZEOF_SEGMENT_COMMAND_64,
-        },
-    },
-};
 use gpt::{GptConfig, disk::LogicalBlockSize, mbr::ProtectiveMBR, partition_types};
+use object::{
+    LittleEndian, Object,
+    elf::PT_LOAD,
+    macho::{
+        CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, EntryPointCommand, LC_MAIN, LC_SEGMENT_64,
+        MH_EXECUTE, MH_MAGIC_64, SegmentCommand64, VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE,
+    },
+    read::elf::{ElfFile64, ProgramHeader},
+};
 
 const TARGET: &str = "aarch64-unknown-none";
 const UEFI_TARGET: &str = "aarch64-unknown-uefi";
@@ -252,13 +251,20 @@ fn gpt_error<E: std::fmt::Display>(err: E) -> io::Error {
 
 #[allow(clippy::too_many_lines)]
 fn convert_elf_to_macho(src: &Path, dst: &Path) -> io::Result<()> {
-    let elf_bytes = fs::read(src)?;
-    let elf = Elf::parse(&elf_bytes).map_err(|err| io::Error::other(err.to_string()))?;
+    use std::mem;
 
+    const SIZEOF_SEGMENT_COMMAND_64: usize = mem::size_of::<SegmentCommand64<LittleEndian>>();
+    const SIZEOF_ENTRY_POINT_COMMAND: usize = mem::size_of::<EntryPointCommand<LittleEndian>>();
+
+    let elf_bytes = fs::read(src)?;
+    let elf = ElfFile64::<LittleEndian>::parse(&*elf_bytes)
+        .map_err(|err| io::Error::other(err.to_string()))?;
+
+    let endian = LittleEndian;
     let loadable: Vec<_> = elf
-        .program_headers
+        .elf_program_headers()
         .iter()
-        .filter(|header| header.p_type == PT_LOAD && header.p_memsz != 0)
+        .filter(|header| header.p_type(endian) == PT_LOAD && header.p_memsz(endian) != 0)
         .collect();
     if loadable.is_empty() {
         return Err(io::Error::other("ELF image has no PT_LOAD segments"));
@@ -276,34 +282,35 @@ fn convert_elf_to_macho(src: &Path, dst: &Path) -> io::Result<()> {
     let mut text_base = None;
     for (index, header) in loadable.iter().enumerate() {
         file_offset = align_usize(file_offset, 0x1000)?;
-        let segname = segment_name(index, header.p_flags);
+        let p_flags = header.p_flags(endian);
+        let segname = segment_name(index, p_flags);
         if segname == *b"__TEXT\0\0\0\0\0\0\0\0\0\0" {
-            text_base = Some((header.p_vaddr, file_offset as u64));
+            text_base = Some((header.p_vaddr(endian), file_offset as u64));
         }
 
         layout.push(MachSegmentLayout {
             segname,
-            vmaddr: header.p_vaddr,
-            vmsize: header.p_memsz,
+            vmaddr: header.p_vaddr(endian),
+            vmsize: header.p_memsz(endian),
             fileoff: file_offset as u64,
-            filesize: header.p_filesz,
-            initprot: vm_prot(header.p_flags),
-            maxprot: vm_prot(header.p_flags),
-            source_offset: usize::try_from(header.p_offset)
+            filesize: header.p_filesz(endian),
+            initprot: vm_prot(p_flags),
+            maxprot: vm_prot(p_flags),
+            source_offset: usize::try_from(header.p_offset(endian))
                 .map_err(|_| io::Error::other("ELF offset overflow"))?,
         });
 
-        let file_size = usize::try_from(header.p_filesz)
+        let file_size = usize::try_from(header.p_filesz(endian))
             .map_err(|_| io::Error::other("ELF file size overflow"))?;
         file_offset = file_offset
             .checked_add(file_size)
             .ok_or_else(|| io::Error::other("Mach-O file size overflow"))?;
     }
 
-    let (text_vmaddr, text_fileoff) =
+    let (text_vmaddr, text_fileoff): (u64, u64) =
         text_base.ok_or_else(|| io::Error::other("ELF image has no executable text segment"))?;
     let entryoff = elf
-        .entry
+        .entry()
         .checked_sub(text_vmaddr.saturating_sub(text_fileoff))
         .ok_or_else(|| io::Error::other("invalid ELF entry for Mach-O conversion"))?;
 
@@ -312,8 +319,8 @@ fn convert_elf_to_macho(src: &Path, dst: &Path) -> io::Result<()> {
     let mut cursor = 0usize;
 
     write_u32(&mut macho, &mut cursor, MH_MAGIC_64);
-    write_u32(&mut macho, &mut cursor, cputype::CPU_TYPE_ARM64);
-    write_u32(&mut macho, &mut cursor, cputype::CPU_SUBTYPE_ARM64_ALL);
+    write_u32(&mut macho, &mut cursor, CPU_TYPE_ARM64);
+    write_u32(&mut macho, &mut cursor, CPU_SUBTYPE_ARM64_ALL);
     write_u32(&mut macho, &mut cursor, MH_EXECUTE);
     write_u32(
         &mut macho,

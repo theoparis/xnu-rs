@@ -1,14 +1,13 @@
 #[allow(clippy::wildcard_imports)]
 use ::liballoc::vec::Vec;
 
-use goblin::mach::{
-    Mach, MachO,
-    load_command::{LC_MAIN, LC_UNIXTHREAD},
+use object::{
+    LittleEndian, Object, ObjectSegment,
+    macho::CPU_TYPE_ARM64,
+    read::macho::{FatArch, MachOFatFile32, MachOFatFile64, MachOFile64},
 };
 
 use crate::arch::aarch64::uart;
-
-const CPU_TYPE_ARM64: u32 = 0x0100_000C;
 
 /// A parsed, loadable segment from a Mach-O image.
 pub struct Segment {
@@ -37,63 +36,113 @@ pub struct UserImage {
 /// it is already a thin binary.
 #[must_use]
 pub fn arm64_slice(bytes: &[u8]) -> Option<&[u8]> {
-    match Mach::parse(bytes).ok()? {
-        Mach::Binary(_) => Some(bytes),
-        Mach::Fat(fat) => {
-            let arch = fat.find_cputype(CPU_TYPE_ARM64).ok()??;
-            let start = arch.offset as usize;
-            let end = start + arch.size as usize;
-            bytes.get(start..end)
+    // Try FAT (64-bit arch entries) first.
+    if let Ok(fat) = MachOFatFile64::parse(bytes) {
+        for arch in fat.arches() {
+            if arch.cputype() == CPU_TYPE_ARM64 {
+                return arch.data(bytes).ok();
+            }
         }
     }
+
+    // Try FAT (32-bit arch entries) — some toolchains emit 32-bit fat headers.
+    if let Ok(fat) = MachOFatFile32::parse(bytes) {
+        for arch in fat.arches() {
+            if arch.cputype() == CPU_TYPE_ARM64 {
+                return arch.data(bytes).ok();
+            }
+        }
+    }
+
+    // Assume thin binary — verify with magic.
+    if MachOFile64::<LittleEndian>::parse(bytes).is_ok() {
+        return Some(bytes);
+    }
+
+    None
 }
 
-/// Read the PC from an `LC_UNIXTHREAD` arm64 load command.
+/// Compute the entry-point virtual address.
 ///
-/// Layout from `cmd_offset` in `bytes`:
-/// ```text
-/// cmd(4) + cmdsize(4) + flavor(4) + count(4)
-/// + x[0..29](232) + fp(8) + lr(8) + sp(8) + pc(8) + cpsr(4)
-/// ```
-/// PC is at offset 4+4+4+4 + 29×8 + 8+8+8 = 272 from the start of the LC.
-fn unixthread_pc(bytes: &[u8], cmd_offset: usize) -> Option<u64> {
-    const PC_OFF: usize = 4 + 4 + 4 + 4 + 29 * 8 + 8 + 8 + 8;
-    let b = bytes.get(cmd_offset + PC_OFF..cmd_offset + PC_OFF + 8)?;
-    Some(u64::from_le_bytes(b.try_into().ok()?))
+/// The object crate's `entry()` returns raw `entryoff` for `LC_MAIN` (a file
+/// offset) or already a VA from `LC_UNIXTHREAD`.  We convert the `LC_MAIN`
+/// case by looking up the `__TEXT` segment.
+fn compute_entry_va(macho: &MachOFile64<'_, object::NativeEndian>, _slice: &[u8]) -> Option<u64> {
+    use object::LittleEndian;
+    use object::macho::{LC_MAIN, LC_UNIXTHREAD};
+
+    let mut commands = macho.macho_load_commands().ok()?;
+    while let Ok(Some(cmd)) = commands.next() {
+        let cmd_id = cmd.cmd();
+        if cmd_id == LC_MAIN {
+            let entry = cmd.entry_point().ok()??;
+            let entryoff = entry.entryoff.get(LittleEndian);
+
+            // Find the __TEXT segment to convert file offset → VA.
+            let text = macho
+                .segments()
+                .find(|s| s.name().ok().flatten() == Some("__TEXT"))?;
+            let (text_fileoff, _) = text.file_range();
+            let text_vmaddr = text.address();
+            return Some(text_vmaddr + (entryoff.saturating_sub(text_fileoff)));
+        }
+        if cmd_id == LC_UNIXTHREAD {
+            // The object crate's `entry()` already handles this, but for
+            // completeness we use its result.
+            return Some(macho.entry());
+        }
+    }
+
+    None
 }
 
 /// Parse a raw Mach-O 64-bit binary (or FAT containing arm64/arm64e) and
 /// extract segments and entry point.
-///
-/// Supports `LC_MAIN` and `LC_UNIXTHREAD` entry-point commands.
 ///
 /// Returns `None` if the binary is not a recognisable arm64 Mach-O or is
 /// missing a loadable segment and a known entry-point command.
 #[must_use]
 pub fn parse(bytes: &[u8]) -> Option<UserImage> {
     let slice = arm64_slice(bytes)?;
-    let macho = MachO::parse(slice, 0).ok()?;
+    let macho = MachOFile64::parse(slice).ok()?;
+
+    // Compute entry VA.  object::entry() returns the raw entryoff (file
+    // offset) for LC_MAIN, or the PC from LC_UNIXTHREAD (already a VA).
+    // We need to convert file offset to VA: find __TEXT and compute
+    //   entry_va = text_vmaddr + (entryoff - text_fileoff)
+    let Some(entry_va) = compute_entry_va(&macho, slice) else {
+        uart::write_str("xnu-rs: Mach-O missing entry point\n");
+        return None;
+    };
 
     // Collect loadable segments.
     let mut segments: Vec<Segment> = Vec::new();
     let mut link_base = u64::MAX;
 
-    for seg in &macho.segments {
-        if seg.vmsize == 0 {
+    for seg in macho.segments() {
+        let vmsize = seg.size();
+        if vmsize == 0 {
             continue;
         }
+
         // __PAGEZERO is a virtual-only 4 GiB guard mapping with no file
         // data; including it inflates link_base and image_span to ~4 GiB.
-        if seg.name().ok() == Some("__PAGEZERO") {
+        if let Ok(Some(name)) = seg.name()
+            && name == "__PAGEZERO"
+        {
             continue;
         }
-        let data = seg.data.to_vec();
-        if seg.vmaddr < link_base {
-            link_base = seg.vmaddr;
+
+        let vmaddr = seg.address();
+        let data = seg.data().map_or_else(|_| Vec::new(), <[u8]>::to_vec);
+
+        if vmaddr < link_base {
+            link_base = vmaddr;
         }
+
         segments.push(Segment {
-            vmaddr: seg.vmaddr,
-            vmsize: seg.vmsize,
+            vmaddr,
+            vmsize,
             data,
         });
     }
@@ -105,40 +154,6 @@ pub fn parse(bytes: &[u8]) -> Option<UserImage> {
     if link_base == u64::MAX {
         link_base = 0;
     }
-
-    // Find entry point: prefer LC_MAIN, fall back to LC_UNIXTHREAD.
-    let mut entry_va: Option<u64> = None;
-
-    for cmd in &macho.load_commands {
-        match cmd.command.cmd() {
-            LC_MAIN => {
-                if let goblin::mach::load_command::CommandVariant::Main(main) = cmd.command {
-                    let text_seg = macho
-                        .segments
-                        .iter()
-                        .find(|s| s.name().ok() == Some("__TEXT"));
-                    if let Some(text) = text_seg {
-                        let entry_offset = main.entryoff.saturating_sub(text.fileoff);
-                        entry_va = Some(text.vmaddr + entry_offset);
-                    }
-                }
-                break;
-            }
-            LC_UNIXTHREAD => {
-                if let Some(pc) = unixthread_pc(slice, cmd.offset) {
-                    // pc is an absolute VA in the binary's virtual address space.
-                    entry_va = Some(pc);
-                }
-                // Don't break; LC_MAIN takes priority if it appears later.
-            }
-            _ => {}
-        }
-    }
-
-    let Some(entry_va) = entry_va else {
-        uart::write_str("xnu-rs: Mach-O missing LC_MAIN / LC_UNIXTHREAD\n");
-        return None;
-    };
 
     Some(UserImage {
         segments,

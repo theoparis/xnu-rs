@@ -65,11 +65,19 @@ const SYS_ABORT_WITH_PAYLOAD: u64 = 521;
 const SYS_SETITIMER: u64 = 38;
 const SYS_KQUEUE_WORKLOOP_CTL: u64 = 483;
 const SYS_WORK_INTERVAL_CTL: u64 = 500;
+const SYS_DUP: u64 = 41;
+const SYS_DUP2: u64 = 90;
+const SYS_PIPE: u64 = 42;
+const SYS_CHDIR: u64 = 12;
+const SYS_FCHDIR: u64 = 13;
 
 // ── Mach trap numbers (u64 wrapping of negative i32) ──────────────────────
 const MACH_ABSOLUTE_TIME: u64 = 0xFFFF_FFFF_FFFF_FFFD; // -3
 const MACH_TIMEBASE_INFO: u64 = 0xFFFF_FFFF_FFFF_FFFC; // -4
+const KERNELRPC_MACH_VM_ALLOCATE_TRAP: u64 = 0xFFFF_FFFF_FFFF_FFF6; // -10
+const KERNELRPC_MACH_VM_DEALLOCATE_TRAP: u64 = 0xFFFF_FFFF_FFFF_FFF4; // -12
 const KERNELRPC_MACH_VM_PROTECT_TRAP: u64 = 0xFFFF_FFFF_FFFF_FFF2; // -14
+const KERNELRPC_MACH_VM_MAP_TRAP: u64 = 0xFFFF_FFFF_FFFF_FFF1; // -15
 const TASK_SELF_TRAP: u64 = 0xFFFF_FFFF_FFFF_FFE4; // -28
 const THREAD_SELF_TRAP: u64 = 0xFFFF_FFFF_FFFF_FFE5; // -27
 const HOST_SELF_TRAP: u64 = 0xFFFF_FFFF_FFFF_FFEC; // -20
@@ -120,6 +128,16 @@ static MMAP_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64:
 const MMAP_REGION_START: u64 = 0x6000_0000;
 const MMAP_REGION_END: u64 = 0xBF00_0000;
 
+// Sentinel FDs for devfs special files (above the open-file table range).
+const DEV_NULL_FD: usize = 100;
+const DEV_CONSOLE_FD: usize = 101;
+const DEV_URANDOM_FD: usize = 102;
+const DEV_ZERO_FD: usize = 103;
+
+fn is_dev_fd(fd: usize) -> bool {
+    matches!(fd, DEV_NULL_FD | DEV_CONSOLE_FD | DEV_URANDOM_FD | DEV_ZERO_FD)
+}
+
 /// Dispatch a Darwin BSD syscall or Mach trap from a user `SVC #0x80`.
 ///
 /// # Safety
@@ -130,9 +148,9 @@ pub unsafe fn dispatch(frame: &mut TrapFrame) {
     let nr = frame.x[16];
     if nr as u32 == 0x8000_0000 {
         dispatch_platform(frame);
-    } else if (nr as i32) < 0 {
+    } else if (nr as u32) >= 0x8000_0000 {
         // Sign-extend the 32-bit Mach trap number to 64-bit so matching works.
-        let mach_nr = (nr as i32) as i64 as u64;
+        let mach_nr = (nr as i32) as u64;
         dispatch_mach(frame, mach_nr);
     } else {
         // Clear carry bit by default (success). Individual error paths will set it.
@@ -157,7 +175,7 @@ fn dispatch_bsd(frame: &mut TrapFrame, nr: u64) {
             let fd = frame.x[0];
             let buf_ptr = frame.x[1] as *const u8;
             let raw_len = frame.x[2];
-            if (fd == 1 || fd == 2) && !buf_ptr.is_null() && raw_len <= 65536 {
+            if (fd == 1 || fd == 2 || fd == DEV_CONSOLE_FD as u64) && !buf_ptr.is_null() && raw_len <= 65536 {
                 #[allow(clippy::cast_possible_truncation)]
                 // SAFETY: identity-mapped user pointer, length clamped above.
                 let bytes = unsafe { core::slice::from_raw_parts(buf_ptr, raw_len as usize) };
@@ -261,8 +279,20 @@ fn dispatch_bsd(frame: &mut TrapFrame, nr: u64) {
             syscall_error(frame, 38); // ENOSYS
         }
 
-        SYS_SETITIMER | SYS_KQUEUE_WORKLOOP_CTL | SYS_WORK_INTERVAL_CTL => {
+        SYS_SETITIMER | SYS_KQUEUE_WORKLOOP_CTL | SYS_WORK_INTERVAL_CTL
+        | SYS_CHDIR | SYS_FCHDIR | SYS_PIPE => {
             frame.x[0] = 0; // success
+        }
+
+        SYS_DUP => {
+            // dup(oldfd) — return a new fd pointing at the same file.
+            // For simplicity, return the same fd number.
+            frame.x[0] = frame.x[0];
+        }
+
+        SYS_DUP2 => {
+            // dup2(oldfd, newfd) — for now just succeed; no real fd table dup.
+            frame.x[0] = frame.x[1]; // return newfd
         }
 
         SYS_ABORT_WITH_PAYLOAD => {
@@ -297,6 +327,13 @@ fn dispatch_bsd(frame: &mut TrapFrame, nr: u64) {
             loop {
                 core::hint::spin_loop();
             }
+        }
+
+        // Stubs for calls dyld/libSystem issues during startup.
+        // 381 = __mac_syscall / sandbox_ms; 242 = proc_rlimit_control
+        // 55  = ioctl variant; 0x37 = sendmsg/setsockopt area
+        55 | 242 | 381 => {
+            frame.x[0] = 0;
         }
 
         _ => {
@@ -376,9 +413,38 @@ fn sys_read(frame: &mut TrapFrame) {
     uart::write_str(" len=0x");
     uart::write_hex_u64(len as u64);
 
-    if fd == 0 {
-        uart::write_str(" -> 0 (stdin)\n");
+    if fd == 0 || fd == DEV_NULL_FD || fd == DEV_CONSOLE_FD {
+        uart::write_str(" -> 0 (eof)\n");
         frame.x[0] = 0;
+        return;
+    }
+
+    if fd == DEV_URANDOM_FD {
+        if !buf_ptr.is_null() {
+            let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, len) };
+            let mut seed: u64;
+            unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) seed) };
+            for b in buf.iter_mut() {
+                seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+                *b = seed as u8;
+            }
+            frame.x[0] = len as u64;
+        } else {
+            frame.x[0] = 0;
+        }
+        uart::write_str(" -> (random)\n");
+        return;
+    }
+
+    if fd == DEV_ZERO_FD {
+        if !buf_ptr.is_null() {
+            let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, len) };
+            buf.fill(0);
+            frame.x[0] = len as u64;
+        } else {
+            frame.x[0] = 0;
+        }
+        uart::write_str(" -> (zeros)\n");
         return;
     }
 
@@ -477,10 +543,28 @@ fn sys_open(frame: &mut TrapFrame) {
     uart::write_str(&path);
     uart::write_str("\"");
 
-    if path == "/dev/null" {
-        uart::write_str(" -> fd=100\n");
-        frame.x[0] = 100;
-        return;
+    match path.as_str() {
+        "/dev/null" => {
+            uart::write_str(" -> fd=100\n");
+            frame.x[0] = DEV_NULL_FD as u64;
+            return;
+        }
+        "/dev/console" | "/dev/tty" | "/dev/stderr" | "/dev/stdout" | "/dev/stdin" => {
+            uart::write_str(" -> fd=101 (console)\n");
+            frame.x[0] = DEV_CONSOLE_FD as u64;
+            return;
+        }
+        "/dev/urandom" | "/dev/random" => {
+            uart::write_str(" -> fd=102 (urandom)\n");
+            frame.x[0] = DEV_URANDOM_FD as u64;
+            return;
+        }
+        "/dev/zero" => {
+            uart::write_str(" -> fd=103 (zero)\n");
+            frame.x[0] = DEV_ZERO_FD as u64;
+            return;
+        }
+        _ => {}
     }
 
     if let Some((data_offset, data_size)) = crate::fs::xnrsfs::get_file_info(&path) {
@@ -524,8 +608,8 @@ fn sys_close(frame: &mut TrapFrame) {
         fds[fd] = None;
         uart::write_str(" -> ok\n");
         frame.x[0] = 0;
-    } else if fd == 100 {
-        uart::write_str(" -> ok (dev null)\n");
+    } else if is_dev_fd(fd) {
+        uart::write_str(" -> ok (devfs)\n");
         frame.x[0] = 0;
     } else {
         uart::write_str(" -> EBADF\n");
@@ -582,10 +666,10 @@ fn sys_fstat64(frame: &mut TrapFrame) {
             syscall_error(frame, 9); // EBADF
             return;
         }
-        if let Some(file) = &fds[fd] {
-            file.data_size
-        } else if fd == 100 {
+        if is_dev_fd(fd) {
             0
+        } else if let Some(file) = &fds[fd] {
+            file.data_size
         } else {
             syscall_error(frame, 9); // EBADF
             return;
@@ -594,10 +678,10 @@ fn sys_fstat64(frame: &mut TrapFrame) {
 
     unsafe {
         core::ptr::write_bytes(st, 0, 144);
-        let mode = if fd == 100 {
-            0x2000 | 0o666
+        let mode = if is_dev_fd(fd) {
+            0x2000 | 0o666 // S_IFCHR | rw-rw-rw-
         } else {
-            0x8000 | 0o755
+            0x8000 | 0o755 // S_IFREG | rwxr-xr-x
         };
         core::ptr::write_unaligned(st.add(4).cast::<u16>(), mode);
         core::ptr::write_unaligned(st.add(96).cast::<u64>(), size);
@@ -823,6 +907,11 @@ fn sys_sysctl(frame: &mut TrapFrame) {
         (CTL_HW, HW_MEMSIZE) => sysctl_u64(oldp, oldlenp, 2 * 1024 * 1024 * 1024),
         (CTL_HW, HW_CPU_FREQ) => sysctl_u32(oldp, oldlenp, 1_000_000_000),
         (CTL_HW, HW_CACHELINESIZE) => sysctl_u32(oldp, oldlenp, 64),
+        (0, _) => {
+            // CTL_UNSPEC = sysctl-by-name lookup; just return ENOENT quietly.
+            syscall_error(frame, 2);
+            return;
+        }
         _ => {
             uart::write_str("xnu-rs: sysctl ");
             uart::write_hex_u64(u64::from(mib0));
@@ -877,6 +966,58 @@ fn dispatch_mach(frame: &mut TrapFrame, nr: u64) {
             }
             frame.x[0] = 0;
         }
+        KERNELRPC_MACH_VM_ALLOCATE_TRAP => {
+            // x0 = task (ignored), x1 = *mach_vm_address_t out, x2 = size, x3 = flags
+            let addr_ptr = frame.x[1] as *mut u64;
+            let size = frame.x[2];
+            let aligned = (size + 0xFFF) & !0xFFF;
+            uart::write_str("xnu-rs: vm_allocate size=0x");
+            uart::write_hex_u64(size);
+            let base = MMAP_BASE.load(core::sync::atomic::Ordering::Relaxed);
+            let start = if base == 0 { MMAP_REGION_START } else { base };
+            if start + aligned <= MMAP_REGION_END {
+                MMAP_BASE.store(start + aligned, core::sync::atomic::Ordering::Relaxed);
+                unsafe { core::ptr::write_bytes(start as *mut u8, 0, aligned as usize) };
+                if !addr_ptr.is_null() {
+                    unsafe { addr_ptr.write(start) };
+                }
+                uart::write_str(" -> 0x");
+                uart::write_hex_u64(start);
+                uart::write_str("\n");
+                frame.x[0] = 0; // KERN_SUCCESS
+            } else {
+                uart::write_str(" -> KERN_NO_SPACE\n");
+                frame.x[0] = 3; // KERN_NO_SPACE
+            }
+        }
+        KERNELRPC_MACH_VM_MAP_TRAP => {
+            // x0 = task (ignored), x1 = *mach_vm_address_t in/out, x2 = size
+            // x3 = mask, x4 = flags, x5 = cur_prot
+            let addr_ptr = frame.x[1] as *mut u64;
+            let size = frame.x[2];
+            let aligned = (size + 0xFFF) & !0xFFF;
+            uart::write_str("xnu-rs: vm_map size=0x");
+            uart::write_hex_u64(size);
+            let base = MMAP_BASE.load(core::sync::atomic::Ordering::Relaxed);
+            let start = if base == 0 { MMAP_REGION_START } else { base };
+            if start + aligned <= MMAP_REGION_END {
+                MMAP_BASE.store(start + aligned, core::sync::atomic::Ordering::Relaxed);
+                unsafe { core::ptr::write_bytes(start as *mut u8, 0, aligned as usize) };
+                if !addr_ptr.is_null() {
+                    unsafe { addr_ptr.write(start) };
+                }
+                uart::write_str(" -> 0x");
+                uart::write_hex_u64(start);
+                uart::write_str("\n");
+                frame.x[0] = 0; // KERN_SUCCESS
+            } else {
+                uart::write_str(" -> KERN_NO_SPACE\n");
+                frame.x[0] = 3; // KERN_NO_SPACE
+            }
+        }
+        KERNELRPC_MACH_VM_DEALLOCATE_TRAP => {
+            frame.x[0] = 0; // KERN_SUCCESS (no-op; no real VM tracking)
+        }
         MACH_MSG_TRAP
         | MACH_MSG2_TRAP
         | KERNELRPC_MACH_PORT_DEALLOCATE
@@ -927,7 +1068,7 @@ fn dispatch_platform(frame: &mut TrapFrame) {
         }
         _ => {
             uart::write_str("xnu-rs: unknown platform syscall code=");
-            uart::write_hex_u64(code as u64);
+            uart::write_hex_u64(u64::from(code));
             uart::write_str("\n");
             frame.x[0] = u64::MAX;
         }

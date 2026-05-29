@@ -9,6 +9,6 @@ publish = false
 workspace = true
 
 [dependencies]
-goblin.workspace = true
+object.workspace = true
 log.workspace = true
 uefi = { workspace = true, features = ["alloc", "global_allocator", "logger"] }

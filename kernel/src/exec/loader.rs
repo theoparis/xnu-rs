@@ -84,6 +84,8 @@ pub unsafe fn load_and_run(bytes: &[u8], load_base: u64) -> ! {
     // Set TPIDRRO_EL0 to point to the start of the user-accessible commpage.
     // This provides a valid, zero-filled page at offset 8 (and indeed the first 16 KiB),
     // which prevents dyld's early TLS checks from null-pointer dereferencing.
+    // SAFETY: Writing to a system register via inline asm; the value is a valid,
+    // reserved, identity-mapped physical address in the VM space.
     unsafe {
         core::arch::asm!("msr tpidrro_el0, {}", in(reg) 0x0000_000F_FFFF_0000u64);
     }
@@ -256,6 +258,8 @@ pub unsafe fn load_dyld_and_run(load_base: u64) -> ! {
     // Set TPIDRRO_EL0 to point to the start of the user-accessible commpage.
     // This provides a valid, zero-filled page at offset 8 (and indeed the first 16 KiB),
     // which prevents dyld's early TLS checks from null-pointer dereferencing.
+    // SAFETY: Writing to a system register via inline asm; the value is a valid,
+    // reserved, identity-mapped physical address in the VM space.
     unsafe {
         core::arch::asm!("msr tpidrro_el0, {}", in(reg) 0x0000_000F_FFFF_0000u64);
     }
@@ -313,21 +317,21 @@ fn load_image(image: &macho::UserImage, load_base: u64) {
 /// the loaded image.
 #[allow(dead_code)]
 unsafe fn apply_chained_fixups(file_bytes: &[u8], load_base: u64, slide: u64) {
-    use goblin::mach::MachO;
+    use object::{LittleEndian, macho::LC_DYLD_CHAINED_FIXUPS, read::macho::MachOFile64};
 
-    const LC_DYLD_CHAINED_FIXUPS: u32 = 0x8000_0034;
-
-    let Ok(macho) = MachO::parse(file_bytes, 0) else {
+    let Ok(macho) = MachOFile64::<LittleEndian>::parse(file_bytes) else {
         return;
     };
 
     // Find LC_DYLD_CHAINED_FIXUPS.
     let mut fixup_dataoff: Option<u32> = None;
-    for cmd in &macho.load_commands {
-        if cmd.command.cmd() == LC_DYLD_CHAINED_FIXUPS {
-            // dataoff is at +8, datasize at +12 in the LC payload.
-            if let Some(b) = file_bytes.get(cmd.offset + 8..cmd.offset + 12) {
-                fixup_dataoff = Some(u32::from_le_bytes(b.try_into().unwrap_or([0; 4])));
+    let Ok(mut commands) = macho.macho_load_commands() else {
+        return;
+    };
+    while let Ok(Some(cmd)) = commands.next() {
+        if cmd.cmd() == LC_DYLD_CHAINED_FIXUPS {
+            if let Ok(data) = cmd.data::<object::macho::LinkeditDataCommand<LittleEndian>>() {
+                fixup_dataoff = Some(data.dataoff.get(LittleEndian));
             }
             break;
         }

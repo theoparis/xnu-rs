@@ -11,4 +11,4 @@ workspace = true
 [dependencies]
 gpt.workspace = true
 fatfs.workspace = true
-goblin.workspace = true
+object.workspace = true

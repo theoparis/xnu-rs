@@ -106,10 +106,10 @@ pub unsafe extern "C" fn exception_lower_el_sync(frame: &mut TrapFrame) {
             uart::write_str(" x");
             // Simple decimal formatting for registers
             if i < 10 {
-                uart::write_byte(b'0' + i as u8);
+                uart::write_byte(b'0' + u8::try_from(i).unwrap_or(0));
             } else {
-                uart::write_byte(b'0' + (i / 10) as u8);
-                uart::write_byte(b'0' + (i % 10) as u8);
+                uart::write_byte(b'0' + u8::try_from(i / 10).unwrap_or(0));
+                uart::write_byte(b'0' + u8::try_from(i % 10).unwrap_or(0));
             }
             uart::write_str("=0x");
             uart::write_hex_u64(frame.x[i]);
