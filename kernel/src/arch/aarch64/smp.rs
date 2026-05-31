@@ -2,7 +2,7 @@
 use super::{gic, uart};
 
 /// PSCI `CPU_ON` function ID (SMC64 calling convention).
-const PSCI_CPU_ON: u64 = 0x8400_0003;
+const PSCI_CPU_ON: u64 = 0xC400_0003;
 
 /// Invoke a PSCI function via SMC (traps to EL3 where QEMU implements PSCI).
 ///
