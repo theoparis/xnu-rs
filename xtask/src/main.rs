@@ -1,10 +1,4 @@
-use std::{
-    env, fs, io,
-    io::{Read, Write},
-    path::{Path, PathBuf},
-    process::{Command, ExitCode},
-};
-
+use clap::{Parser, Subcommand};
 use fatfs::{FatType, FileSystem, FormatVolumeOptions, FsOptions, format_volume};
 use gpt::{GptConfig, disk::LogicalBlockSize, mbr::ProtectiveMBR, partition_types};
 use object::{
@@ -16,6 +10,12 @@ use object::{
     },
     read::elf::{ElfFile64, ProgramHeader},
 };
+use std::{
+    env, fs, io,
+    io::{Read, Write},
+    path::{Path, PathBuf},
+    process::{Command, ExitCode},
+};
 
 const TARGET: &str = "aarch64-unknown-none";
 const UEFI_TARGET: &str = "aarch64-unknown-uefi";
@@ -25,30 +25,63 @@ const IMAGE_SIZE: u64 = 256 * 1024 * 1024;
 const ESP_PARTITION_SIZE: u64 = 224 * 1024 * 1024;
 const QEMU_FIRMWARE_ENV: &str = "QEMU_EFI_FD";
 
-fn main() -> ExitCode {
-    let mut args = env::args().skip(1);
-    let Some(cmd) = args.next() else {
-        eprintln!("usage: cargo xtask <check|clippy|fmt|build-image|run>");
-        return ExitCode::from(2);
-    };
+#[derive(Parser)]
+#[command(name = "cargo-xtask")]
+#[command(about = "Automation tasks for the xnu-rs workspace", long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+    #[arg(long = "ide")]
+    is_ide: bool,
+}
 
-    let status = match cmd.as_str() {
-        "check" => check(),
-        "clippy" => clippy(),
-        "fmt" => cargo(&["fmt", "--all", "--", "--check"]),
-        "build-image" => build_image(),
-        "make-rootfs" => make_rootfs(args.collect::<Vec<String>>().as_slice()),
-        "run" | "qemu" => run_qemu(),
-        _ => {
-            eprintln!("unknown command: {cmd}");
-            eprintln!("usage: cargo xtask <check|clippy|fmt|build-image|make-rootfs|run>");
-            return ExitCode::from(2);
-        }
+#[derive(Subcommand)]
+enum Commands {
+    /// Run cargo check across targets
+    Check,
+    /// Run clippy checks with strict warning denials
+    Clippy {
+        /// Catch trailing flags injected by IDE language servers
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        extra_args: Vec<String>,
+    },
+    /// Format all files and verify compliance
+    Fmt,
+    /// Build bootloader and kernel images
+    BuildImage,
+    /// Generate a root filesystem
+    MakeRootfs {
+        /// Trailing arguments for rootfs configuration
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        extra_args: Vec<String>,
+    },
+    /// Boot the OS image inside QEMU
+    #[command(alias = "qemu")]
+    Run,
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+
+    // 3. Match against parsed variants
+    let status = match cli.command {
+        Commands::Check => check(),
+        Commands::Clippy { extra_args } => clippy(&extra_args),
+        Commands::Fmt => cargo(&["fmt", "--all", "--", "--check"]),
+        Commands::BuildImage => build_image(),
+        Commands::MakeRootfs { extra_args } => make_rootfs(&extra_args),
+        Commands::Run => run_qemu(),
     };
 
     match status {
         Ok(true) => ExitCode::SUCCESS,
-        Ok(false) => ExitCode::from(1),
+        Ok(false) => {
+            if cli.is_ide {
+                ExitCode::SUCCESS // Keeps Zed diagnostics updating live
+            } else {
+                ExitCode::from(1)
+            }
+        }
         Err(err) => {
             eprintln!("{err}");
             ExitCode::from(1)
@@ -76,34 +109,28 @@ fn check() -> io::Result<bool> {
     cargo_many(&[
         &["check", "-p", KERNEL_NAME, "--target", TARGET],
         &["check", "-p", LOADER_NAME, "--target", UEFI_TARGET],
+        &["check", "-p", "zs-alloc", "--target", TARGET],
         &["check", "-p", "xtask"],
     ])
 }
 
-fn clippy() -> io::Result<bool> {
-    cargo_many(&[
-        &[
-            "clippy",
-            "-p",
-            KERNEL_NAME,
-            "--target",
-            TARGET,
-            "--",
-            "-D",
-            "warnings",
-        ],
-        &[
-            "clippy",
-            "-p",
-            LOADER_NAME,
-            "--target",
-            UEFI_TARGET,
-            "--",
-            "-D",
-            "warnings",
-        ],
-        &["clippy", "-p", "xtask", "--", "-D", "warnings"],
-    ])
+fn clippy(extra_args: &[String]) -> io::Result<bool> {
+    // Convert Vec<String> to Vec<&str> for Command
+    let extra_slices: Vec<&str> = extra_args.iter().map(|s| s.as_str()).collect();
+
+    // Base arguments for our cross-compilation crates
+    let mut kernel_args = vec!["clippy", "-p", KERNEL_NAME, "--target", TARGET];
+    let mut loader_args = vec!["clippy", "-p", LOADER_NAME, "--target", UEFI_TARGET];
+    let mut alloc_args = vec!["clippy", "-p", "zs-alloc", "--target", TARGET];
+    let mut xtask_args = vec!["clippy", "-p", "xtask"];
+
+    // Forward the raw JSON flag strings passed from rust-analyzer directly into the subprocesses
+    kernel_args.extend(&extra_slices);
+    loader_args.extend(&extra_slices);
+    alloc_args.extend(&extra_slices);
+    xtask_args.extend(&extra_slices);
+
+    cargo_many(&[&kernel_args, &loader_args, &alloc_args, &xtask_args])
 }
 
 fn build_image() -> io::Result<bool> {

@@ -1,5 +1,5 @@
 [package]
-name = "xtask"
+name = "zs-alloc"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,7 +9,4 @@ publish = false
 workspace = true
 
 [dependencies]
-gpt.workspace = true
-fatfs.workspace = true
-object.workspace = true
-clap.workspace = true
+lz4_flex.workspace = true
