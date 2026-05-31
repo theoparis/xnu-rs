@@ -1,0 +1,11 @@
+[target.aarch64-apple-darwin]
+linker = "rust-lld"
+rustflags = [
+    # Set minimum macOS version to 13.0 — this causes ld64.lld to emit
+    # LC_DYLD_CHAINED_FIXUPS (format 12) instead of the older LC_DYLD_INFO_ONLY,
+    # which is what lib/loader/src/fixup.rs handles.
+    "-Clink-arg=-platform_version",
+    "-Clink-arg=macos",
+    "-Clink-arg=13.0",
+    "-Clink-arg=13.0",
+]

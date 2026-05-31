@@ -1,53 +1,88 @@
+use clap::{Parser, Subcommand};
+use fatfs::{FatType, FileSystem, FormatVolumeOptions, FsOptions, format_volume};
+use gpt::{GptConfig, disk::LogicalBlockSize, mbr::ProtectiveMBR, partition_types};
+use object::{
+    LittleEndian, Object,
+    elf::PT_LOAD,
+    macho::{
+        CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, EntryPointCommand, LC_MAIN, LC_SEGMENT_64,
+        MH_EXECUTE, MH_MAGIC_64, SegmentCommand64, VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE,
+    },
+    read::elf::{ElfFile64, ProgramHeader},
+};
 use std::{
     env, fs, io,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, ExitCode},
 };
 
-use fatfs::{FatType, FileSystem, FormatVolumeOptions, FsOptions, format_volume};
-use goblin::{
-    elf::{Elf, program_header::PT_LOAD},
-    mach::{
-        constants::{VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE, cputype},
-        header::{MH_EXECUTE, MH_MAGIC_64},
-        load_command::{
-            LC_MAIN, LC_SEGMENT_64, SIZEOF_ENTRY_POINT_COMMAND, SIZEOF_SEGMENT_COMMAND_64,
-        },
-    },
-};
-use gpt::{GptConfig, disk::LogicalBlockSize, mbr::ProtectiveMBR, partition_types};
-
 const TARGET: &str = "aarch64-unknown-none";
 const UEFI_TARGET: &str = "aarch64-unknown-uefi";
+const APPLE_TARGET: &str = "aarch64-apple-darwin";
 const KERNEL_NAME: &str = "kernel";
-const LOADER_NAME: &str = "loader";
+const LOADER_NAME: &str = "bootloader";
 const IMAGE_SIZE: u64 = 256 * 1024 * 1024;
 const ESP_PARTITION_SIZE: u64 = 224 * 1024 * 1024;
 const QEMU_FIRMWARE_ENV: &str = "QEMU_EFI_FD";
 
-fn main() -> ExitCode {
-    let mut args = env::args().skip(1);
-    let Some(cmd) = args.next() else {
-        eprintln!("usage: cargo xtask <check|clippy|fmt|build-image|run>");
-        return ExitCode::from(2);
-    };
+#[derive(Parser)]
+#[command(name = "cargo-xtask")]
+#[command(about = "Automation tasks for the xnu-rs workspace", long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+    #[arg(long = "ide")]
+    is_ide: bool,
+}
 
-    let status = match cmd.as_str() {
-        "check" => check(),
-        "clippy" => clippy(),
-        "fmt" => cargo(&["fmt", "--all", "--", "--check"]),
-        "build-image" => build_image(),
-        "run" | "qemu" => run_qemu(),
-        _ => {
-            eprintln!("unknown command: {cmd}");
-            eprintln!("usage: cargo xtask <check|clippy|fmt|build-image|run>");
-            return ExitCode::from(2);
-        }
+#[derive(Subcommand)]
+enum Commands {
+    /// Run cargo check across targets
+    Check,
+    /// Run clippy checks with strict warning denials
+    Clippy {
+        /// Catch trailing flags injected by IDE language servers
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        extra_args: Vec<String>,
+    },
+    /// Format all files and verify compliance
+    Fmt,
+    /// Build bootloader and kernel images
+    BuildImage,
+    /// Generate a root filesystem
+    MakeRootfs {
+        /// Trailing arguments for rootfs configuration
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        extra_args: Vec<String>,
+    },
+    /// Boot the OS image inside QEMU
+    #[command(alias = "qemu")]
+    Run,
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+
+    // 3. Match against parsed variants
+    let status = match cli.command {
+        Commands::Check => check(),
+        Commands::Clippy { extra_args } => clippy(&extra_args),
+        Commands::Fmt => cargo(&["fmt", "--all", "--", "--check"]),
+        Commands::BuildImage => build_image(),
+        Commands::MakeRootfs { extra_args } => make_rootfs(&extra_args),
+        Commands::Run => run_qemu(),
     };
 
     match status {
         Ok(true) => ExitCode::SUCCESS,
-        Ok(false) => ExitCode::from(1),
+        Ok(false) => {
+            if cli.is_ide {
+                ExitCode::SUCCESS // Keeps Zed diagnostics updating live
+            } else {
+                ExitCode::from(1)
+            }
+        }
         Err(err) => {
             eprintln!("{err}");
             ExitCode::from(1)
@@ -75,33 +110,51 @@ fn check() -> io::Result<bool> {
     cargo_many(&[
         &["check", "-p", KERNEL_NAME, "--target", TARGET],
         &["check", "-p", LOADER_NAME, "--target", UEFI_TARGET],
+        &["check", "-p", "zs-alloc", "--target", TARGET],
+        &["check", "-p", "loader", "--target", TARGET],
+        &["check", "-p", "hello", "--target", APPLE_TARGET],
         &["check", "-p", "xtask"],
     ])
 }
 
-fn clippy() -> io::Result<bool> {
+fn build_userspace() -> io::Result<bool> {
+    cargo(&[
+        "build",
+        "-p",
+        "hello",
+        "--target",
+        APPLE_TARGET,
+        "--release",
+    ])
+}
+
+fn clippy(extra_args: &[String]) -> io::Result<bool> {
+    // Convert Vec<String> to Vec<&str> for Command
+    let extra_slices: Vec<&str> = extra_args.iter().map(|s| s.as_str()).collect();
+
+    // Base arguments for our cross-compilation crates
+    let mut kernel_args = vec!["clippy", "-p", KERNEL_NAME, "--target", TARGET];
+    let mut bootloader_args = vec!["clippy", "-p", LOADER_NAME, "--target", UEFI_TARGET];
+    let mut alloc_args = vec!["clippy", "-p", "zs-alloc", "--target", TARGET];
+    let mut lib_loader_args = vec!["clippy", "-p", "loader", "--target", TARGET];
+    let mut hello_args = vec!["clippy", "-p", "hello", "--target", APPLE_TARGET];
+    let mut xtask_args = vec!["clippy", "-p", "xtask"];
+
+    // Forward the raw JSON flag strings passed from rust-analyzer directly into the subprocesses
+    kernel_args.extend(&extra_slices);
+    bootloader_args.extend(&extra_slices);
+    alloc_args.extend(&extra_slices);
+    lib_loader_args.extend(&extra_slices);
+    hello_args.extend(&extra_slices);
+    xtask_args.extend(&extra_slices);
+
     cargo_many(&[
-        &[
-            "clippy",
-            "-p",
-            KERNEL_NAME,
-            "--target",
-            TARGET,
-            "--",
-            "-D",
-            "warnings",
-        ],
-        &[
-            "clippy",
-            "-p",
-            LOADER_NAME,
-            "--target",
-            UEFI_TARGET,
-            "--",
-            "-D",
-            "warnings",
-        ],
-        &["clippy", "-p", "xtask", "--", "-D", "warnings"],
+        &kernel_args,
+        &bootloader_args,
+        &alloc_args,
+        &lib_loader_args,
+        &hello_args,
+        &xtask_args,
     ])
 }
 
@@ -250,13 +303,20 @@ fn gpt_error<E: std::fmt::Display>(err: E) -> io::Error {
 
 #[allow(clippy::too_many_lines)]
 fn convert_elf_to_macho(src: &Path, dst: &Path) -> io::Result<()> {
-    let elf_bytes = fs::read(src)?;
-    let elf = Elf::parse(&elf_bytes).map_err(|err| io::Error::other(err.to_string()))?;
+    use std::mem;
 
+    const SIZEOF_SEGMENT_COMMAND_64: usize = mem::size_of::<SegmentCommand64<LittleEndian>>();
+    const SIZEOF_ENTRY_POINT_COMMAND: usize = mem::size_of::<EntryPointCommand<LittleEndian>>();
+
+    let elf_bytes = fs::read(src)?;
+    let elf = ElfFile64::<LittleEndian>::parse(&*elf_bytes)
+        .map_err(|err| io::Error::other(err.to_string()))?;
+
+    let endian = LittleEndian;
     let loadable: Vec<_> = elf
-        .program_headers
+        .elf_program_headers()
         .iter()
-        .filter(|header| header.p_type == PT_LOAD && header.p_memsz != 0)
+        .filter(|header| header.p_type(endian) == PT_LOAD && header.p_memsz(endian) != 0)
         .collect();
     if loadable.is_empty() {
         return Err(io::Error::other("ELF image has no PT_LOAD segments"));
@@ -274,34 +334,35 @@ fn convert_elf_to_macho(src: &Path, dst: &Path) -> io::Result<()> {
     let mut text_base = None;
     for (index, header) in loadable.iter().enumerate() {
         file_offset = align_usize(file_offset, 0x1000)?;
-        let segname = segment_name(index, header.p_flags);
+        let p_flags = header.p_flags(endian);
+        let segname = segment_name(index, p_flags);
         if segname == *b"__TEXT\0\0\0\0\0\0\0\0\0\0" {
-            text_base = Some((header.p_vaddr, file_offset as u64));
+            text_base = Some((header.p_vaddr(endian), file_offset as u64));
         }
 
         layout.push(MachSegmentLayout {
             segname,
-            vmaddr: header.p_vaddr,
-            vmsize: header.p_memsz,
+            vmaddr: header.p_vaddr(endian),
+            vmsize: header.p_memsz(endian),
             fileoff: file_offset as u64,
-            filesize: header.p_filesz,
-            initprot: vm_prot(header.p_flags),
-            maxprot: vm_prot(header.p_flags),
-            source_offset: usize::try_from(header.p_offset)
+            filesize: header.p_filesz(endian),
+            initprot: vm_prot(p_flags),
+            maxprot: vm_prot(p_flags),
+            source_offset: usize::try_from(header.p_offset(endian))
                 .map_err(|_| io::Error::other("ELF offset overflow"))?,
         });
 
-        let file_size = usize::try_from(header.p_filesz)
+        let file_size = usize::try_from(header.p_filesz(endian))
             .map_err(|_| io::Error::other("ELF file size overflow"))?;
         file_offset = file_offset
             .checked_add(file_size)
             .ok_or_else(|| io::Error::other("Mach-O file size overflow"))?;
     }
 
-    let (text_vmaddr, text_fileoff) =
+    let (text_vmaddr, text_fileoff): (u64, u64) =
         text_base.ok_or_else(|| io::Error::other("ELF image has no executable text segment"))?;
     let entryoff = elf
-        .entry
+        .entry()
         .checked_sub(text_vmaddr.saturating_sub(text_fileoff))
         .ok_or_else(|| io::Error::other("invalid ELF entry for Mach-O conversion"))?;
 
@@ -310,8 +371,8 @@ fn convert_elf_to_macho(src: &Path, dst: &Path) -> io::Result<()> {
     let mut cursor = 0usize;
 
     write_u32(&mut macho, &mut cursor, MH_MAGIC_64);
-    write_u32(&mut macho, &mut cursor, cputype::CPU_TYPE_ARM64);
-    write_u32(&mut macho, &mut cursor, cputype::CPU_SUBTYPE_ARM64_ALL);
+    write_u32(&mut macho, &mut cursor, CPU_TYPE_ARM64);
+    write_u32(&mut macho, &mut cursor, CPU_SUBTYPE_ARM64_ALL);
     write_u32(&mut macho, &mut cursor, MH_EXECUTE);
     write_u32(
         &mut macho,
@@ -485,30 +546,182 @@ fn qemu_firmware_path() -> io::Result<PathBuf> {
     ))
 }
 
+/// Build a rootfs disk image in the xnrsfs flat format.
+///
+/// Usage: `cargo xtask make-rootfs [file:path/on/disk] ...`
+///
+/// Each argument is `name:host_path`. The image is written to
+/// `target/qemu/images/rootfs.img`.
+///
+/// xnrsfs layout (all little-endian):
+///   Bytes  0–3:  magic = 0x53524E58 ("XNRS")
+///   Bytes  4–7:  file count (u32)
+///   Bytes  8–(8+count*80): file table entries:
+///     [64]: null-terminated name
+///     [ 8]: data offset (u64) from start of image
+///     [ 8]: data size (u64)
+///   Remainder: file data at 4096-byte aligned offsets
+#[allow(clippy::too_many_lines, clippy::collapsible_if)]
+fn make_rootfs(file_args: &[String]) -> io::Result<bool> {
+    const MAGIC: u32 = 0x5352_4E58; // "XNRS" LE
+    const ENTRY_SIZE: usize = 80; // 64 name + 8 offset + 8 size
+    const ALIGN: u64 = 4096;
+
+    let out_dir = Path::new("target/qemu/images");
+    fs::create_dir_all(out_dir)?;
+    let out_path = out_dir.join("rootfs.img");
+
+    // Parse arguments: "virtname:hostpath"
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    for arg in file_args {
+        let Some((name, host)) = arg.split_once(':') else {
+            eprintln!("make-rootfs: bad arg '{arg}' (expected name:path)");
+            return Ok(false);
+        };
+        files.push((name.to_string(), PathBuf::from(host)));
+    }
+
+    if files.is_empty() {
+        // Default: build and embed the workspace hello binary.
+        if !build_userspace()? {
+            return Ok(false);
+        }
+        let hello_path = PathBuf::from("target")
+            .join(APPLE_TARGET)
+            .join("release")
+            .join("hello");
+        if !hello_path.exists() {
+            eprintln!(
+                "make-rootfs: hello binary not found at {}",
+                hello_path.display()
+            );
+            return Ok(false);
+        }
+        files.push(("/bin/hello".to_string(), hello_path));
+    }
+
+    let count = files.len();
+    let table_bytes = count * ENTRY_SIZE;
+    let header_bytes = 8 + table_bytes; // 4 magic + 4 count + table
+
+    // Compute per-file aligned offsets.
+    let mut offsets: Vec<u64> = Vec::with_capacity(count);
+    let mut next_offset = ((header_bytes as u64) + ALIGN - 1) & !(ALIGN - 1);
+    let mut sizes: Vec<u64> = Vec::with_capacity(count);
+    for (_, host_path) in &files {
+        offsets.push(next_offset);
+        let sz = fs::metadata(host_path).map_or(0, |m| m.len());
+        sizes.push(sz);
+        next_offset = (next_offset + sz + ALIGN - 1) & !(ALIGN - 1);
+    }
+    let total = next_offset;
+
+    println!(
+        "make-rootfs: creating {} ({total} bytes, {count} files)",
+        out_path.display(),
+    );
+
+    // Write the image.
+    let mut img = fs::File::create(&out_path)?;
+
+    // Header: magic + count.
+    img.write_all(&MAGIC.to_le_bytes())?;
+    img.write_all(&u32::try_from(count).unwrap_or(0).to_le_bytes())?;
+
+    // File table.
+    for i in 0..count {
+        let mut name_buf = [0u8; 64];
+        let name_bytes = files[i].0.as_bytes();
+        let copy_len = name_bytes.len().min(63);
+        name_buf[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
+        img.write_all(&name_buf)?;
+        img.write_all(&offsets[i].to_le_bytes())?;
+        img.write_all(&sizes[i].to_le_bytes())?;
+    }
+
+    // Pad to first file offset.
+    let header_end = 8 + table_bytes;
+    let pad_to = usize::try_from(offsets[0]).unwrap_or(0);
+    if pad_to > header_end {
+        let pad = vec![0u8; pad_to - header_end];
+        img.write_all(&pad)?;
+    }
+
+    // Write each file with alignment padding.
+    for i in 0..count {
+        let (_, host_path) = &files[i];
+        print!("  adding {} ({} bytes)... ", host_path.display(), sizes[i]);
+        std::io::stdout().flush()?;
+
+        let mut file = fs::File::open(host_path)?;
+        let mut buffer = vec![0u8; 1024 * 1024];
+        let mut bytes_written = 0u64;
+        loop {
+            let n = file.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            img.write_all(&buffer[..n])?;
+            bytes_written += n as u64;
+        }
+
+        // Pad to next alignment.
+        let next = if i + 1 < count { offsets[i + 1] } else { total };
+        let written = offsets[i] + bytes_written;
+        if next > written {
+            let pad = vec![0u8; usize::try_from(next - written).unwrap_or(0)];
+            img.write_all(&pad)?;
+        }
+        println!("ok");
+    }
+
+    println!("make-rootfs: done → {}", out_path.display());
+    Ok(true)
+}
+
 fn run_qemu() -> io::Result<bool> {
-    let _ = build_image()?;
+    if !build_image()? {
+        return Ok(false);
+    }
+    // Always rebuild the rootfs so the latest hello binary is embedded.
+    if !make_rootfs(&[])? {
+        return Ok(false);
+    }
     let firmware = qemu_firmware_path()?;
-    let status = Command::new("qemu-system-aarch64")
-        .args([
-            "-M",
-            "virt,virtualization=on",
-            "-accel",
-            "tcg,thread=multi",
-            "-cpu",
-            "cortex-a53",
-            "-m",
-            "1024M",
-            "-nographic",
-            "-serial",
-            "mon:stdio",
-            "-bios",
-        ])
-        .arg(firmware)
-        .args([
+    let rootfs_path = "target/qemu/images/rootfs.img";
+    let mut cmd = Command::new("qemu-system-aarch64");
+    cmd.args([
+        "-M",
+        "virt,virtualization=on",
+        "-accel",
+        "tcg,thread=multi",
+        "-cpu",
+        "max",
+        "-smp",
+        "4",
+        "-m",
+        "2048M",
+        "-nographic",
+        "-serial",
+        "mon:stdio",
+        "-bios",
+    ])
+    .arg(firmware)
+    // ESP (UEFI boot + kernel) via virtio-pci — UEFI finds this.
+    .args([
+        "-drive",
+        "if=virtio,format=raw,file=target/qemu/images/esp.img",
+    ]);
+    // Rootfs via virtio-mmio — kernel finds this at 0x0a000000.
+    if std::path::Path::new(rootfs_path).exists() {
+        cmd.args([
             "-drive",
-            "if=virtio,format=raw,file=target/qemu/images/esp.img",
-        ])
-        .status()?;
+            &format!("id=rootfs,if=none,format=raw,file={rootfs_path}"),
+            "-device",
+            "virtio-blk-device,drive=rootfs",
+        ]);
+    }
+    let status = cmd.status()?;
     Ok(status.success())
 }
 

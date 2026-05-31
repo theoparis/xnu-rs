@@ -1,0 +1,11 @@
+[package]
+name = "hello"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Opt out of workspace lints — this crate targets aarch64-apple-darwin,
+# not bare-metal aarch64-unknown-none, so the no_std provenance lints
+# and dead_code analysis don't apply cleanly across targets.
+[lints]

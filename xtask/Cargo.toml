@@ -1,7 +1,8 @@
 [package]
 name = "xtask"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 publish = false
 
 [lints]
@@ -10,4 +11,5 @@ workspace = true
 [dependencies]
 gpt.workspace = true
 fatfs.workspace = true
-goblin.workspace = true
+object.workspace = true
+clap.workspace = true

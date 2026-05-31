@@ -1,0 +1,18 @@
+{
+  "lsp": {
+    "rust-analyzer": {
+      "initialization_options": {
+        "checkOnSave": true,
+        "check": {
+          "overrideCommand": [
+            "cargo",
+            "xtask",
+            "--ide",
+            "clippy",
+            "--message-format=json",
+          ],
+        },
+      },
+    },
+  },
+}

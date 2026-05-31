@@ -1,3 +1,26 @@
+/// Enable FP/SIMD access at EL1 and EL0 by setting CPACR_EL1.FPEN = 0b11.
+///
+/// Without this, any use of FP or NEON registers (including compiler-generated
+/// `memcpy`/`memset` using SIMD) traps as a synchronous exception (EC=0x07).
+///
+/// # Safety
+///
+/// Must be called at EL1 after `drop_to_el1_if_needed`.  Safe to call before
+/// the MMU is enabled.
+pub unsafe fn enable_fp() {
+    // SAFETY: Writes CPACR_EL1.FPEN[21:20] = 0b11 to allow FP/SIMD at EL0/EL1.
+    unsafe {
+        core::arch::asm!(
+            "mrs {t}, cpacr_el1",
+            "orr {t}, {t}, #(3 << 20)",
+            "msr cpacr_el1, {t}",
+            "isb",
+            t = out(reg) _,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 /// Drop from EL2 to EL1 if we are currently running at EL2.
 ///
 /// QEMU `virt` with `virtualization=on` keeps the firmware (and therefore
@@ -11,7 +34,8 @@
 ///
 /// Must be the very first thing called in `_start`, before any code that
 /// reads or writes EL1 system registers.
-pub unsafe fn drop_to_el1_if_needed() {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn drop_to_el1_if_needed() {
     // `CurrentEL` bits [3:2] encode the current exception level.
     let current_el: u64;
     // SAFETY: `CurrentEL` is a read-only architectural register.

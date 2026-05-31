@@ -1,9 +1,8 @@
 [package]
 name = "kernel"
-version = "0.1.0"
-edition = "2024"
-license = "MIT OR Apache-2.0"
-rust-version = "1.98"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 publish = false
 
 [lints]
@@ -12,7 +11,9 @@ workspace = true
 [dependencies]
 log.workspace = true
 spin.workspace = true
-goblin.workspace = true
+object.workspace = true
 aarch64-cpu.workspace = true
 aarch64-paging.workspace = true
 arm-gic.workspace = true
+zs-alloc.workspace = true
+loader.workspace = true

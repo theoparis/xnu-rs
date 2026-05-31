@@ -5,7 +5,6 @@
 This repository is a Rust workspace for an XNU-compatible AArch64 Darwin kernel.
 
 ### Standard commands
-- `cargo xtask check`
 - `cargo xtask clippy`
 - `cargo xtask fmt`
 - `cargo xtask build-image`
@@ -13,8 +12,8 @@ This repository is a Rust workspace for an XNU-compatible AArch64 Darwin kernel.
 
 ### Build flow
 1. Edit kernel, loader, or xtask code.
-2. Run `cargo xtask check`.
-3. Run `cargo xtask clippy`.
+2. Run `cargo xtask clippy`.
+3. Run `cargo xtask fmt`.
 4. Run `cargo xtask build-image` to build the UEFI loader and generate a GPT/ESP disk image.
 5. Run `cargo xtask run` to launch QEMU with the current kernel.
 
