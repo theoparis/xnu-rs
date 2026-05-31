@@ -13,6 +13,7 @@ pub mod ipc;
 pub mod mach;
 pub mod mm;
 pub mod sched;
+pub mod syscall;
 pub mod util;
 
 #[alloc_error_handler]

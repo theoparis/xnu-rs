@@ -2,7 +2,6 @@ use core::arch::global_asm;
 
 use super::context::TrapFrame;
 use super::gic;
-use super::syscall;
 use super::uart;
 
 // TrapFrame is 34 × 8 = 272 bytes.  The assembly below must stay in sync with
@@ -54,8 +53,16 @@ pub unsafe extern "C" fn exception_lower_el_sync(frame: &mut TrapFrame) {
 
     if ec == 0x15 {
         // EC = 0b010101: SVC64 — syscall from `AArch64` EL0.
-        // SAFETY: Caller guarantees `frame` is a valid EL0 trap frame.
-        unsafe { syscall::dispatch(frame) };
+        let mut args = [0u64; 8];
+        args.copy_from_slice(&frame.x[0..8]);
+        let mut ctx = crate::syscall::SyscallContext::new(frame.x[16], args);
+        crate::syscall::dispatch(&mut ctx);
+        frame.x[0] = ctx.return_val();
+        if ctx.has_error() {
+            frame.pstate |= 1 << 29;
+        } else {
+            frame.pstate &= !(1 << 29);
+        }
     } else {
         uart::write_str("xnu-rs: unexpected lower-EL sync exception EC=0x");
         uart::write_hex_u64(ec);
