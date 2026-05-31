@@ -123,6 +123,10 @@ secondary_entry:
 /// already set up. Must not return.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn secondary_main() -> ! {
+    // Enable FP/SIMD — same requirement as on the primary CPU.
+    // SAFETY: Called at EL1 after drop_to_el1_if_needed in secondary_entry.
+    unsafe { super::boot::enable_fp() };
+
     // Initialize GIC CPU interface for this CPU.
     // SAFETY: Called once per secondary CPU during its bring-up.
     unsafe { gic::init_cpu_interface() };

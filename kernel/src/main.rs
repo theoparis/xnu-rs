@@ -23,6 +23,11 @@ pub extern "C" fn _start(boot_args: *const BootArgs) -> ! {
     // SAFETY: First thing in _start; no EL1 system registers touched yet.
     unsafe { boot::drop_to_el1_if_needed() };
 
+    // Enable FP/SIMD at EL1 and EL0. Without this the compiler's NEON-based
+    // memcpy/memset trap immediately as EC=0x07.
+    // SAFETY: We are now at EL1; CPACR_EL1 is accessible.
+    unsafe { boot::enable_fp() };
+
     // SAFETY: Single-core bring-up path sets this once during early boot.
     unsafe {
         BOOT_ARGS_PTR = boot_args;

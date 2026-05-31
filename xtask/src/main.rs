@@ -687,6 +687,8 @@ fn run_qemu() -> io::Result<bool> {
         "tcg,thread=multi",
         "-cpu",
         "max",
+        "-smp",
+        "4",
         "-m",
         "2048M",
         "-nographic",
