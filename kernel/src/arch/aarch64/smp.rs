@@ -82,14 +82,10 @@ pub unsafe fn boot_secondaries(count: u32) {
             )
         };
 
-        uart::write_str("xnu-rs: cpu");
-        uart::write_hex_u64(u64::from(cpu));
         if ret == 0 {
-            uart::write_str(" online\n");
+            uart::write_str_hex_nl("xnu-rs: cpu online id=", u64::from(cpu));
         } else {
-            uart::write_str(" psci_call failed ret=");
-            uart::write_hex_u64(ret.cast_unsigned());
-            uart::write_str("\n");
+            uart::write_str_hex_nl("xnu-rs: cpu psci_call failed ret=", ret.cast_unsigned());
         }
     }
 }
@@ -132,9 +128,7 @@ pub unsafe extern "C" fn secondary_main() -> ! {
     unsafe { gic::init_cpu_interface() };
 
     let cpu = this_cpu();
-    uart::write_str("xnu-rs: cpu");
-    uart::write_hex_u64(u64::from(cpu));
-    uart::write_str(" secondary_main\n");
+    uart::write_str_hex_nl("xnu-rs: cpu secondary_main id=", u64::from(cpu));
 
     // Install EL1 exception vectors for this CPU.
     // SAFETY: Called once during secondary CPU bring-up before enabling IRQs.
