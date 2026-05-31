@@ -129,16 +129,8 @@ pub(super) unsafe fn setup_darwin_stack(
 
     // SAFETY: stack region is valid writable identity-mapped RAM.
     unsafe {
-        core::ptr::copy_nonoverlapping(
-            app_path.as_ptr(),
-            str1_addr as *mut u8,
-            app_path.len(),
-        );
-        core::ptr::copy_nonoverlapping(
-            exe_path.as_ptr(),
-            str2_addr as *mut u8,
-            exe_path.len(),
-        );
+        core::ptr::copy_nonoverlapping(app_path.as_ptr(), str1_addr as *mut u8, app_path.len());
+        core::ptr::copy_nonoverlapping(exe_path.as_ptr(), str2_addr as *mut u8, exe_path.len());
     }
 
     // Table: mh(8) + argc(8) + argv[0](8) + null(8) + null(8) + apple[0](8) + null(8)
@@ -148,13 +140,13 @@ pub(super) unsafe fn setup_darwin_stack(
     // SAFETY: sp..sp+table_size is within the allocated stack region.
     unsafe {
         let p = sp as *mut u64;
-        p.write(mach_header);  // mh
-        p.add(1).write(1);     // argc
+        p.write(mach_header); // mh
+        p.add(1).write(1); // argc
         p.add(2).write(str1_addr); // argv[0]
-        p.add(3).write(0);     // argv end
-        p.add(4).write(0);     // envp end
+        p.add(3).write(0); // argv end
+        p.add(4).write(0); // envp end
         p.add(5).write(str2_addr); // apple[0]
-        p.add(6).write(0);     // apple end
+        p.add(6).write(0); // apple end
     }
 
     sp

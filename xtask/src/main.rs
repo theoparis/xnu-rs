@@ -118,7 +118,14 @@ fn check() -> io::Result<bool> {
 }
 
 fn build_userspace() -> io::Result<bool> {
-    cargo(&["build", "-p", "hello", "--target", APPLE_TARGET, "--release"])
+    cargo(&[
+        "build",
+        "-p",
+        "hello",
+        "--target",
+        APPLE_TARGET,
+        "--release",
+    ])
 }
 
 fn clippy(extra_args: &[String]) -> io::Result<bool> {
@@ -584,7 +591,10 @@ fn make_rootfs(file_args: &[String]) -> io::Result<bool> {
             .join("release")
             .join("hello");
         if !hello_path.exists() {
-            eprintln!("make-rootfs: hello binary not found at {}", hello_path.display());
+            eprintln!(
+                "make-rootfs: hello binary not found at {}",
+                hello_path.display()
+            );
             return Ok(false);
         }
         files.push(("/bin/hello".to_string(), hello_path));

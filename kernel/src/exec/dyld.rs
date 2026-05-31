@@ -15,8 +15,7 @@ use crate::arch::aarch64::{
 };
 
 use super::loader::{
-    PAGE_SIZE, STACK_SIZE, align_up, flush_dcache_invalidate_icache, load_image,
-    setup_darwin_stack,
+    PAGE_SIZE, STACK_SIZE, align_up, flush_dcache_invalidate_icache, load_image, setup_darwin_stack,
 };
 use super::macho::UserImage;
 
@@ -43,18 +42,27 @@ pub unsafe fn load_and_run(image: &UserImage<'_>, file_bytes: &[u8], load_base: 
     // SAFETY: load_base is valid RAM per caller contract; load_image handles alignment.
     unsafe { load_image(image, load_base) };
 
-    // 2. Apply chained fixups (rebase pass) if the binary has them.
-    //    LC_DYLD_CHAINED_FIXUPS is the newer format (macOS 13+, format 12).
-    //    LC_DYLD_INFO_ONLY (older format) is not currently interpreted — for
-    //    our no_std hello binary the rebase table is empty so this is fine.
+    // 2. Apply fixups (rebase pass only; bind entries are left zeroed).
+    //
+    //    Two formats exist:
+    //    * LC_DYLD_CHAINED_FIXUPS — macOS 13+, format 12 chain pointer walk.
+    //    * LC_DYLD_INFO_ONLY      — pre-macOS 13, rebase opcode byte stream.
+    //
+    //    A binary produced by the linker has exactly one of these; we dispatch
+    //    to the right handler and skip fixups if neither is present (static
+    //    binaries, or the empty-rebase case of our no_std hello binary).
     let slide = image.slide_for(load_base);
     if image.chained_fixups.is_some() {
-        uart::write_str("xnu-rs: dyld: applying chained fixups slide=0x");
-        uart::write_hex_u64(slide);
-        uart::write_str("\n");
+        uart::write_str_hex_nl("xnu-rs: dyld: chained fixups slide=0x", slide);
         // SAFETY: image segments are loaded at load_base in valid RAM;
         // file_bytes is the source Mach-O with the fixup chain data.
         unsafe { ::loader::fixup::apply_arm64e_userland(file_bytes, load_base, slide) };
+    } else if image.dyld_info.is_some_and(|i| i.rebase_size > 0) {
+        uart::write_str_hex_nl("xnu-rs: dyld: LC_DYLD_INFO rebase slide=0x", slide);
+        // SAFETY: image segments are loaded at load_base; file_bytes is the source Mach-O.
+        unsafe {
+            ::loader::fixup::apply_dyld_info_rebase(file_bytes, load_base, image.link_base, slide)
+        };
     }
 
     // 3. Flush D-cache and invalidate I-cache for the loaded region.
@@ -133,4 +141,3 @@ pub fn log_deps(image: &UserImage<'_>, name: &str) {
         uart::write_str("\n");
     }
 }
-

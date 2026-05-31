@@ -1,8 +1,12 @@
-//! Chained fixup application for `DYLD_CHAINED_PTR_ARM64E_USERLAND` (format 12).
+//! Fixup application for loaded Mach-O images.
 //!
-//! This module reads the `LC_DYLD_CHAINED_FIXUPS` blob from a loaded image and
-//! rewrites every rebase pointer with the applied slide.  Bind entries are
-//! skipped (they are resolved by dyld, not the kernel).
+//! Two formats are supported:
+//!
+//! * **`LC_DYLD_CHAINED_FIXUPS`** (macOS 13+ / format 12): chain-pointer walk.
+//! * **`LC_DYLD_INFO_ONLY`** (pre-macOS 13): rebase opcode byte stream.
+//!
+//! Bind entries are skipped in both cases — symbol resolution from dylibs is
+//! not yet implemented.
 //!
 //! # Chain pointer format 12 encoding
 //!
@@ -156,4 +160,186 @@ pub unsafe fn apply_arm64e_userland(file_bytes: &[u8], load_base: u64, slide: u6
             }
         }
     }
+}
+
+// ── LC_DYLD_INFO_ONLY rebase opcode interpreter ───────────────────────────────
+
+/// Apply the `LC_DYLD_INFO_ONLY` rebase opcode stream to a freshly loaded image.
+///
+/// Reads the segment table from the raw Mach-O (including `__PAGEZERO`, so
+/// segment indices in the opcode stream match what dyld expects) and slides
+/// every pointer-typed rebase target.
+///
+/// # Safety
+///
+/// * `[load_base, …)` must be valid, writable, identity-mapped RAM containing
+///   the loaded image.
+/// * `file_bytes` must be the raw arm64 Mach-O slice that was parsed to produce
+///   the loaded image; the rebase opcodes are read from its `__LINKEDIT`.
+pub unsafe fn apply_dyld_info_rebase(
+    file_bytes: &[u8],
+    load_base: u64,
+    link_base: u64,
+    slide: u64,
+) {
+    use alloc::vec::Vec;
+    use object::{
+        LittleEndian as LE, Object, ObjectSegment, macho::LC_DYLD_INFO_ONLY,
+        read::macho::MachOFile64,
+    };
+
+    let Ok(macho) = MachOFile64::<LE>::parse(file_bytes) else {
+        return;
+    };
+
+    // Locate the rebase opcode stream offset/size from LC_DYLD_INFO_ONLY.
+    let mut rebase_off: u32 = 0;
+    let mut rebase_size: u32 = 0;
+    let Ok(mut cmds) = macho.macho_load_commands() else {
+        return;
+    };
+    while let Ok(Some(cmd)) = cmds.next() {
+        let lc = cmd.cmd();
+        if lc == LC_DYLD_INFO_ONLY || lc == object::macho::LC_DYLD_INFO {
+            if let Ok(c) = cmd.data::<object::macho::DyldInfoCommand<LE>>() {
+                rebase_off = c.rebase_off.get(LE);
+                rebase_size = c.rebase_size.get(LE);
+            }
+            break;
+        }
+    }
+    if rebase_size == 0 {
+        return;
+    }
+    let Some(opcodes) =
+        file_bytes.get(rebase_off as usize..rebase_off as usize + rebase_size as usize)
+    else {
+        return;
+    };
+
+    // Build a segment runtime-address table in Mach-O load-command order.
+    // This MUST include __PAGEZERO (index 0) so the rebase stream indices match.
+    let mut seg_runtime: Vec<u64> = Vec::new();
+    for seg in macho.segments() {
+        let vmaddr = seg.address();
+        // __PAGEZERO has vmaddr == 0; runtime address is not meaningful for rebase.
+        let runtime = if vmaddr == 0 {
+            0
+        } else {
+            load_base.wrapping_add(vmaddr.wrapping_sub(link_base))
+        };
+        seg_runtime.push(runtime);
+    }
+
+    // Interpret the opcode stream.
+    const POINTER_SIZE: u64 = 8;
+    let mut seg_index: usize = 0;
+    let mut seg_offset: u64 = 0;
+    let mut i: usize = 0;
+
+    while i < opcodes.len() {
+        let byte = opcodes[i];
+        i += 1;
+        let opcode = byte & 0xF0;
+        let imm = u64::from(byte & 0x0F);
+
+        match opcode {
+            // REBASE_OPCODE_DONE
+            0x00 => break,
+            // REBASE_OPCODE_SET_TYPE_IMM — type 1 = pointer; we always treat as pointer
+            0x10 => {}
+            // REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB
+            0x20 => {
+                seg_index = imm as usize;
+                let (val, n) = read_uleb128(&opcodes[i..]);
+                i += n;
+                seg_offset = val;
+            }
+            // REBASE_OPCODE_ADD_ADDR_ULEB
+            0x30 => {
+                let (val, n) = read_uleb128(&opcodes[i..]);
+                i += n;
+                seg_offset = seg_offset.wrapping_add(val);
+            }
+            // REBASE_OPCODE_ADD_ADDR_IMM_SCALED
+            0x40 => {
+                seg_offset = seg_offset.wrapping_add(imm.wrapping_mul(POINTER_SIZE));
+            }
+            // REBASE_OPCODE_DO_REBASE_IMM_TIMES
+            0x50 => {
+                for _ in 0..imm {
+                    // SAFETY: within the loaded image's writable RAM.
+                    unsafe { rebase_ptr(&seg_runtime, seg_index, seg_offset, slide) };
+                    seg_offset = seg_offset.wrapping_add(POINTER_SIZE);
+                }
+            }
+            // REBASE_OPCODE_DO_REBASE_ULEB_TIMES
+            0x60 => {
+                let (count, n) = read_uleb128(&opcodes[i..]);
+                i += n;
+                for _ in 0..count {
+                    // SAFETY: within the loaded image's writable RAM.
+                    unsafe { rebase_ptr(&seg_runtime, seg_index, seg_offset, slide) };
+                    seg_offset = seg_offset.wrapping_add(POINTER_SIZE);
+                }
+            }
+            // REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB
+            0x70 => {
+                // SAFETY: within the loaded image's writable RAM.
+                unsafe { rebase_ptr(&seg_runtime, seg_index, seg_offset, slide) };
+                let (val, n) = read_uleb128(&opcodes[i..]);
+                i += n;
+                seg_offset = seg_offset.wrapping_add(val).wrapping_add(POINTER_SIZE);
+            }
+            // REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB
+            0x80 => {
+                let (count, n) = read_uleb128(&opcodes[i..]);
+                i += n;
+                let (skip, n2) = read_uleb128(&opcodes[i..]);
+                i += n2;
+                for _ in 0..count {
+                    // SAFETY: within the loaded image's writable RAM.
+                    unsafe { rebase_ptr(&seg_runtime, seg_index, seg_offset, slide) };
+                    seg_offset = seg_offset.wrapping_add(skip).wrapping_add(POINTER_SIZE);
+                }
+            }
+            _ => {} // unknown opcode — skip
+        }
+    }
+}
+
+/// Slide the 8-byte pointer at `seg_runtime[seg_index] + seg_offset`.
+///
+/// # Safety
+///
+/// The computed address must be valid writable RAM (within the loaded image).
+unsafe fn rebase_ptr(seg_runtime: &[u64], seg_index: usize, seg_offset: u64, slide: u64) {
+    let Some(&base) = seg_runtime.get(seg_index) else {
+        return;
+    };
+    if base == 0 {
+        return; // __PAGEZERO — never rebased
+    }
+    let addr = base.wrapping_add(seg_offset);
+    // SAFETY: caller guarantees addr is in loaded RAM.
+    let val = unsafe { core::ptr::read_volatile(addr as *const u64) };
+    // SAFETY: writable loaded RAM.
+    unsafe { core::ptr::write_volatile(addr as *mut u64, val.wrapping_add(slide)) };
+}
+
+/// Decode one ULEB128 value from `bytes`. Returns `(value, bytes_consumed)`.
+fn read_uleb128(bytes: &[u8]) -> (u64, usize) {
+    let mut val: u64 = 0;
+    let mut shift: u32 = 0;
+    let mut i: usize = 0;
+    loop {
+        let Some(&byte) = bytes.get(i) else { break };
+        i += 1;
+        val |= u64::from(byte & 0x7F) << shift;
+        shift += 7;
+        if byte & 0x80 == 0 || shift >= 64 {
+            break;
+        }
+    }
+    (val, i)
 }
