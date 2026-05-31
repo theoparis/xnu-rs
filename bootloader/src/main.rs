@@ -15,7 +15,7 @@ use core::{
 };
 
 use boot_args::BootArgs;
-use loader::MachO;
+use bootloader::MachO;
 use uefi::{
     boot::{self, AllocateType, MemoryType, PAGE_SIZE},
     cstr16, entry,

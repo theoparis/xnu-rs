@@ -89,13 +89,24 @@ pub extern "C" fn _start(boot_args: *const BootArgs) -> ! {
     // SAFETY: GIC distributor is initialized; called from CPU0.
     unsafe { smp::boot_secondaries(4) };
 
-    // Try to load dyld+zsh from the rootfs disk. Fall back to the embedded
-    // test binary if no rootfs is present (no virtio-blk found).
+    // Try to load /bin/hello from the rootfs disk via the kernel minimal dyld.
+    // Fall back to the embedded test binary if no rootfs is present.
     if kernel::drivers::virtio::blk::VIRTIO_BLK.get().is_some() {
+        let Some(app_bytes) = kernel::fs::xnrsfs::read_file("/bin/hello") else {
+            uart::write_str("xnu-rs: /bin/hello not found on rootfs\n");
+            // SAFETY: load_base is aligned, past the kernel, in valid RAM.
+            unsafe { kernel::exec::loader::load_and_run(TEST_USER_MACHO, load_base) };
+        };
+        let Some(image) = kernel::exec::macho::parse(&app_bytes) else {
+            uart::write_str("xnu-rs: failed to parse /bin/hello\n");
+            // SAFETY: same as above.
+            unsafe { kernel::exec::loader::load_and_run(TEST_USER_MACHO, load_base) };
+        };
+        kernel::exec::dyld::log_deps(&image, "/bin/hello");
         // SAFETY: `load_base` is aligned, past the kernel, in valid RAM,
-        // with enough room for dyld + zsh + stack.
+        // with enough room for the image span + STACK_SIZE.
         unsafe {
-            kernel::exec::loader::load_dyld_and_run(load_base);
+            kernel::exec::dyld::load_and_run(&image, &app_bytes, load_base);
         }
     }
 

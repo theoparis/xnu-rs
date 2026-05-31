@@ -5,6 +5,7 @@ members = [
     "bootloader",
     "lib/loader",
     "lib/zs-alloc",
+    "userspace/hello",
 ]
 resolver = "3"
 

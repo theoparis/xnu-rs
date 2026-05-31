@@ -19,8 +19,9 @@ use std::{
 
 const TARGET: &str = "aarch64-unknown-none";
 const UEFI_TARGET: &str = "aarch64-unknown-uefi";
+const APPLE_TARGET: &str = "aarch64-apple-darwin";
 const KERNEL_NAME: &str = "kernel";
-const LOADER_NAME: &str = "loader";
+const LOADER_NAME: &str = "bootloader";
 const IMAGE_SIZE: u64 = 256 * 1024 * 1024;
 const ESP_PARTITION_SIZE: u64 = 224 * 1024 * 1024;
 const QEMU_FIRMWARE_ENV: &str = "QEMU_EFI_FD";
@@ -110,9 +111,14 @@ fn check() -> io::Result<bool> {
         &["check", "-p", KERNEL_NAME, "--target", TARGET],
         &["check", "-p", LOADER_NAME, "--target", UEFI_TARGET],
         &["check", "-p", "zs-alloc", "--target", TARGET],
-        &["check", "-p", "macho", "--target", TARGET],
+        &["check", "-p", "loader", "--target", TARGET],
+        &["check", "-p", "hello", "--target", APPLE_TARGET],
         &["check", "-p", "xtask"],
     ])
+}
+
+fn build_userspace() -> io::Result<bool> {
+    cargo(&["build", "-p", "hello", "--target", APPLE_TARGET, "--release"])
 }
 
 fn clippy(extra_args: &[String]) -> io::Result<bool> {
@@ -121,23 +127,26 @@ fn clippy(extra_args: &[String]) -> io::Result<bool> {
 
     // Base arguments for our cross-compilation crates
     let mut kernel_args = vec!["clippy", "-p", KERNEL_NAME, "--target", TARGET];
-    let mut loader_args = vec!["clippy", "-p", LOADER_NAME, "--target", UEFI_TARGET];
+    let mut bootloader_args = vec!["clippy", "-p", LOADER_NAME, "--target", UEFI_TARGET];
     let mut alloc_args = vec!["clippy", "-p", "zs-alloc", "--target", TARGET];
-    let mut macho_args = vec!["clippy", "-p", "macho", "--target", TARGET];
+    let mut lib_loader_args = vec!["clippy", "-p", "loader", "--target", TARGET];
+    let mut hello_args = vec!["clippy", "-p", "hello", "--target", APPLE_TARGET];
     let mut xtask_args = vec!["clippy", "-p", "xtask"];
 
     // Forward the raw JSON flag strings passed from rust-analyzer directly into the subprocesses
     kernel_args.extend(&extra_slices);
-    loader_args.extend(&extra_slices);
+    bootloader_args.extend(&extra_slices);
     alloc_args.extend(&extra_slices);
-    macho_args.extend(&extra_slices);
+    lib_loader_args.extend(&extra_slices);
+    hello_args.extend(&extra_slices);
     xtask_args.extend(&extra_slices);
 
     cargo_many(&[
         &kernel_args,
-        &loader_args,
+        &bootloader_args,
         &alloc_args,
-        &macho_args,
+        &lib_loader_args,
+        &hello_args,
         &xtask_args,
     ])
 }
@@ -566,37 +575,19 @@ fn make_rootfs(file_args: &[String]) -> io::Result<bool> {
     }
 
     if files.is_empty() {
-        // Default: add dyld and zsh from the host if they exist.
-        for (name, host) in [("/usr/lib/dyld", "/usr/lib/dyld"), ("/bin/zsh", "/bin/zsh")] {
-            let p = Path::new(host);
-            if p.exists() {
-                files.push((name.to_string(), p.to_path_buf()));
-            }
-        }
-        // Dyld shared cache (arm64e, split-file format).
-        let cache_dirs = [
-            Path::new("/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld"),
-            Path::new("/System/Library/dyld"),
-        ];
-        for cache_dir in cache_dirs {
-            if let Ok(entries) = fs::read_dir(cache_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-                        if filename.starts_with("dyld_shared_cache_arm64e") {
-                            let dest_path = format!("/System/Library/dyld/{filename}");
-                            if !files.iter().any(|(d, _)| d == &dest_path) {
-                                files.push((dest_path, path));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if files.is_empty() {
-            eprintln!("make-rootfs: no files specified and no host binaries found");
+        // Default: build and embed the workspace hello binary.
+        if !build_userspace()? {
             return Ok(false);
         }
+        let hello_path = PathBuf::from("target")
+            .join(APPLE_TARGET)
+            .join("release")
+            .join("hello");
+        if !hello_path.exists() {
+            eprintln!("make-rootfs: hello binary not found at {}", hello_path.display());
+            return Ok(false);
+        }
+        files.push(("/bin/hello".to_string(), hello_path));
     }
 
     let count = files.len();
@@ -679,7 +670,13 @@ fn make_rootfs(file_args: &[String]) -> io::Result<bool> {
 }
 
 fn run_qemu() -> io::Result<bool> {
-    let _ = build_image()?;
+    if !build_image()? {
+        return Ok(false);
+    }
+    // Always rebuild the rootfs so the latest hello binary is embedded.
+    if !make_rootfs(&[])? {
+        return Ok(false);
+    }
     let firmware = qemu_firmware_path()?;
     let rootfs_path = "target/qemu/images/rootfs.img";
     let mut cmd = Command::new("qemu-system-aarch64");
