@@ -129,13 +129,7 @@ pub fn log_deps(image: &UserImage<'_>, name: &str) {
     }
     if let Some(uuid) = image.uuid {
         uart::write_str("  UUID   ");
-        for b in &uuid {
-            // Print each byte as a 2-char hex value.
-            let hi = b >> 4;
-            let lo = b & 0xF;
-            uart::write_hex_u64(u64::from(hi));
-            uart::write_hex_u64(u64::from(lo));
-        }
+        uart::write_uuid(&uuid);
         uart::write_str("\n");
     }
 }
