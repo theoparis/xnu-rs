@@ -1,8 +1,12 @@
 #![allow(clippy::cast_possible_truncation, clippy::undocumented_unsafe_blocks)]
 
-use core::sync::atomic::AtomicU32;
-
 use crate::arch::uart;
+use crate::ipc::mach_msg::{MACH_RCV_MSG, MACH_SEND_MSG};
+use crate::ipc::mach_port::{NAMESPACE, Port};
+use crate::ipc::rights::RightKind;
+
+use liballoc::sync::Arc;
+use spin::Mutex;
 
 use super::SyscallContext;
 
@@ -30,8 +34,6 @@ const SEMAPHORE_WAIT_TRAP: u64 = 0xFFFF_FFFF_FFFF_FFE2; // -30
 const SWTCH_PRI_TRAP: u64 = 0xFFFF_FFFF_FFFF_FFFB; // -5
 const SWTCH_TRAP: u64 = 0xFFFF_FFFF_FFFF_FFFA; // -6
 
-static PORT_COUNTER: AtomicU32 = AtomicU32::new(10);
-
 pub(super) fn dispatch(ctx: &mut SyscallContext, nr: u64) {
     match nr {
         MACH_ABSOLUTE_TIME => {
@@ -47,30 +49,84 @@ pub(super) fn dispatch(ctx: &mut SyscallContext, nr: u64) {
             }
             ctx.set_return(0);
         }
+
+        // ── Well-known port names ─────────────────────────────────────────
         TASK_SELF_TRAP => {
-            ctx.set_return(1);
+            ctx.set_return(u64::from(crate::mach::task::TASK_SELF_NAME));
         }
         THREAD_SELF_TRAP => {
-            ctx.set_return(2);
+            ctx.set_return(u64::from(crate::mach::task::THREAD_SELF_NAME));
         }
         HOST_SELF_TRAP => {
-            ctx.set_return(3);
+            ctx.set_return(u64::from(crate::mach::task::HOST_SELF_NAME));
         }
+
+        // ── Port allocation ───────────────────────────────────────────────
         MACH_REPLY_PORT => {
-            ctx.set_return(u64::from(
-                PORT_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
-            ));
+            let port = Arc::new(Mutex::new(Port::new()));
+            let name = NAMESPACE.lock().insert(port, RightKind::Receive);
+            ctx.set_return(u64::from(name));
         }
         KERNELRPC_MACH_PORT_ALLOCATE => {
-            let p = ctx.arg(2) as *mut u32;
-            let name = PORT_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            if !p.is_null() {
-                unsafe { p.write(name) };
+            // x0 = task (ignored), x1 = right kind, x2 = *mach_port_name_t out
+            let out_ptr = ctx.arg(2) as *mut u32;
+            let port = Arc::new(Mutex::new(Port::new()));
+            let name = NAMESPACE.lock().insert(port, RightKind::Receive);
+            if !out_ptr.is_null() {
+                unsafe { out_ptr.write(name) };
             }
+            ctx.set_return(0); // KERN_SUCCESS
+        }
+        KERNELRPC_MACH_PORT_DEALLOCATE => {
+            // x0 = task (ignored), x1 = port name
+            let name = ctx.arg(1) as u32;
+            NAMESPACE.lock().deallocate(name);
             ctx.set_return(0);
         }
+        KERNELRPC_MACH_PORT_INSERT_RIGHT => {
+            // x0 = task, x1 = name, x2 = poly (ignored), x3 = right_type
+            // Look up the existing port for `name` and add a Send right.
+            let name = ctx.arg(1) as u32;
+            let port_arc = NAMESPACE.lock().lookup(name).map(|e| Arc::clone(&e.port));
+            if let Some(port) = port_arc {
+                let send_name = NAMESPACE.lock().insert(port, RightKind::Send);
+                ctx.set_return(u64::from(send_name));
+            } else {
+                ctx.set_return(0);
+            }
+        }
+
+        // ── Mach message ──────────────────────────────────────────────────
+        MACH_MSG_TRAP | MACH_MSG2_TRAP => {
+            // mach_msg(msg, option, send_size, rcv_size, rcv_name, timeout, notify)
+            // x0=msg_addr x1=option x2=send_size x3=rcv_size x4=rcv_name
+            let msg_addr = ctx.arg(0) as usize;
+            let option = ctx.arg(1) as u32;
+            let send_size = ctx.arg(2) as u32;
+            let rcv_size = ctx.arg(3) as u32;
+            let rcv_name = ctx.arg(4) as u32;
+
+            let mut result = crate::ipc::mach_msg::MACH_MSG_SUCCESS;
+
+            if option & MACH_SEND_MSG != 0 {
+                // SAFETY: msg_addr is a user pointer; send() validates size.
+                result = unsafe {
+                    crate::ipc::mach_msg::send(&mut NAMESPACE.lock(), msg_addr, send_size)
+                };
+            }
+
+            if result == crate::ipc::mach_msg::MACH_MSG_SUCCESS && option & MACH_RCV_MSG != 0 {
+                // SAFETY: msg_addr is a user pointer; recv() validates size.
+                result = unsafe {
+                    crate::ipc::mach_msg::recv(&NAMESPACE.lock(), rcv_name, msg_addr, rcv_size)
+                };
+            }
+
+            ctx.set_return(u64::from(result));
+        }
+
+        // ── VM allocation ─────────────────────────────────────────────────
         KERNELRPC_MACH_VM_ALLOCATE_TRAP => {
-            // x0 = task (ignored), x1 = *mach_vm_address_t out, x2 = size, x3 = flags
             let addr_ptr = ctx.arg(1) as *mut u64;
             let size = ctx.arg(2);
             let aligned = (size + 0xFFF) & !0xFFF;
@@ -91,15 +147,13 @@ pub(super) fn dispatch(ctx: &mut SyscallContext, nr: u64) {
                 uart::write_str(" -> 0x");
                 uart::write_hex_u64(start);
                 uart::write_str("\n");
-                ctx.set_return(0); // KERN_SUCCESS
+                ctx.set_return(0);
             } else {
                 uart::write_str(" -> KERN_NO_SPACE\n");
-                ctx.set_return(3); // KERN_NO_SPACE
+                ctx.set_return(3);
             }
         }
         KERNELRPC_MACH_VM_MAP_TRAP => {
-            // x0 = task (ignored), x1 = *mach_vm_address_t in/out, x2 = size
-            // x3 = mask, x4 = flags, x5 = cur_prot
             let addr_ptr = ctx.arg(1) as *mut u64;
             let size = ctx.arg(2);
             let aligned = (size + 0xFFF) & !0xFFF;
@@ -120,20 +174,18 @@ pub(super) fn dispatch(ctx: &mut SyscallContext, nr: u64) {
                 uart::write_str(" -> 0x");
                 uart::write_hex_u64(start);
                 uart::write_str("\n");
-                ctx.set_return(0); // KERN_SUCCESS
+                ctx.set_return(0);
             } else {
                 uart::write_str(" -> KERN_NO_SPACE\n");
-                ctx.set_return(3); // KERN_NO_SPACE
+                ctx.set_return(3);
             }
         }
         KERNELRPC_MACH_VM_DEALLOCATE_TRAP => {
-            ctx.set_return(0); // KERN_SUCCESS (no-op; no real VM tracking)
+            ctx.set_return(0);
         }
-        MACH_MSG_TRAP
-        | MACH_MSG2_TRAP
-        | KERNELRPC_MACH_PORT_DEALLOCATE
-        | KERNELRPC_MACH_PORT_MOD_REFS
-        | KERNELRPC_MACH_PORT_INSERT_RIGHT
+
+        // ── No-ops ────────────────────────────────────────────────────────
+        KERNELRPC_MACH_PORT_MOD_REFS
         | KERNELRPC_MACH_PORT_CONSTRUCT
         | KERNELRPC_MACH_PORT_DESTRUCT
         | SEMAPHORE_SIGNAL_TRAP
@@ -143,6 +195,7 @@ pub(super) fn dispatch(ctx: &mut SyscallContext, nr: u64) {
         | SWTCH_TRAP => {
             ctx.set_return(0);
         }
+
         _ => {
             uart::write_str("xnu-rs: mach x16=");
             uart::write_hex_u64(nr);

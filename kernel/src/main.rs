@@ -70,6 +70,7 @@ pub extern "C" fn _start(boot_args: *const BootArgs) -> ! {
     // Initialise the cooperative scheduler and task table.
     sched::init_runqueue();
     sched::init_task_table();
+    kernel::mach::task::init();
     uart::write_str("xnu-rs: scheduler init\n");
 
     // Initialize GIC distributor (CPU0 only).
