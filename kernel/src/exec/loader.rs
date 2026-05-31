@@ -26,14 +26,7 @@ pub unsafe fn load_and_run(bytes: &[u8], load_base: u64) -> ! {
         }
     };
 
-    let mut image_end = 0_u64;
-    for seg in &image.segments {
-        let end = seg.vmaddr.saturating_add(seg.vmsize);
-        if end > image_end {
-            image_end = end;
-        }
-    }
-    let image_span = image_end.saturating_sub(image.link_base);
+    let image_span = image.image_span();
 
     uart::write_str("xnu-rs: loading user image link_base=0x");
     uart::write_hex_u64(image.link_base);
@@ -67,7 +60,7 @@ pub unsafe fn load_and_run(bytes: &[u8], load_base: u64) -> ! {
         flush_dcache_invalidate_icache(load_base, image_span as usize);
     }
 
-    let entry_phys = load_base + (image.entry_va - image.link_base);
+    let entry_phys = load_base + (image.entry_va().unwrap_or(0) - image.link_base);
     let stack_base = align_up(load_base + image_span, PAGE_SIZE);
     let stack_top = stack_base + STACK_SIZE;
 
@@ -150,14 +143,18 @@ pub unsafe fn load_dyld_and_run(load_base: u64) -> ! {
         }
     };
 
+    // ── Log dependencies ───────────────────────────────────────────────────
+    super::dyld::log_deps(&dyld, "dyld");
+    super::dyld::log_deps(&zsh, "zsh");
+
     // ── Load dyld ──────────────────────────────────────────────────────────
-    let dyld_span = image_span(&dyld);
+    let dyld_span = dyld.image_span();
     load_image(&dyld, load_base);
 
     // Compute the slide applied to dyld (link_base → load_base).
     // dyld links at vmaddr=0, so slide = load_base.
     let dyld_slide = load_base.wrapping_sub(dyld.link_base);
-    let dyld_entry = load_base + (dyld.entry_va - dyld.link_base);
+    let dyld_entry = load_base + (dyld.entry_va().unwrap_or(0) - dyld.link_base);
 
     // NOTE: We do NOT apply chained fixups here. dyld is designed to
     // self-rebase via its own `rebaseDyld()` during `__dyld_start`.
@@ -173,7 +170,7 @@ pub unsafe fn load_dyld_and_run(load_base: u64) -> ! {
 
     // ── Load zsh ───────────────────────────────────────────────────────────
     let zsh_load_base = align_up(load_base + dyld_span, PAGE_SIZE * 2);
-    let zsh_span = image_span(&zsh);
+    let zsh_span = zsh.image_span();
     load_image(&zsh, zsh_load_base);
 
     let zsh_header_pa = zsh_load_base;
@@ -272,19 +269,8 @@ pub unsafe fn load_dyld_and_run(load_base: u64) -> ! {
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-fn image_span(image: &macho::UserImage) -> u64 {
-    let mut end = 0u64;
-    for seg in &image.segments {
-        let e = seg.vmaddr.saturating_add(seg.vmsize);
-        if e > end {
-            end = e;
-        }
-    }
-    end.saturating_sub(image.link_base)
-}
-
-fn load_image(image: &macho::UserImage, load_base: u64) {
-    let span = image_span(image);
+fn load_image(image: &macho::UserImage<'_>, load_base: u64) {
+    let span = image.image_span();
     // SAFETY: load_base is valid writable RAM; zeroing before copying handles BSS.
     #[allow(clippy::cast_possible_truncation)]
     unsafe {
@@ -300,135 +286,6 @@ fn load_image(image: &macho::UserImage, load_base: u64) {
             core::ptr::copy_nonoverlapping(seg.data.as_ptr(), dst, copy_len);
         }
     }
-}
-
-/// Apply `DYLD_CHAINED_PTR_ARM64E_USERLAND` (format 12) fixup chains.
-///
-/// Walks every chain and rewrites each rebase entry:
-/// - plain rebase  → target = slide + (high8 << 56) + target32
-/// - auth rebase   → target = slide + target32  (PAC disabled in `SCTLR_EL1`)
-///
-/// Bind entries (dyld has 0 imports) are skipped.
-///
-/// # Safety
-///
-/// `[load_base, load_base + image_size)` must be valid writable RAM.
-/// `file_bytes` must be the raw arm64/arm64e Mach-O slice used to produce
-/// the loaded image.
-#[allow(dead_code)]
-unsafe fn apply_chained_fixups(file_bytes: &[u8], load_base: u64, slide: u64) {
-    use object::{LittleEndian, macho::LC_DYLD_CHAINED_FIXUPS, read::macho::MachOFile64};
-
-    let Ok(macho) = MachOFile64::<LittleEndian>::parse(file_bytes) else {
-        return;
-    };
-
-    // Find LC_DYLD_CHAINED_FIXUPS.
-    let mut fixup_dataoff: Option<u32> = None;
-    let Ok(mut commands) = macho.macho_load_commands() else {
-        return;
-    };
-    while let Ok(Some(cmd)) = commands.next() {
-        if cmd.cmd() == LC_DYLD_CHAINED_FIXUPS {
-            if let Ok(data) = cmd.data::<object::macho::LinkeditDataCommand<LittleEndian>>() {
-                fixup_dataoff = Some(data.dataoff.get(LittleEndian));
-            }
-            break;
-        }
-    }
-    let Some(foff) = fixup_dataoff else { return };
-
-    // The fixup data lives in LINKEDIT (file-offset == vmaddr for dyld),
-    // which we loaded at load_base + vmaddr.
-    let fixup_runtime = load_base + u64::from(foff);
-
-    // dyld_chained_fixups_header { fixups_version(4) starts_offset(4) ... }
-    // SAFETY: fixup_runtime is within loaded RAM.
-    let starts_offset = unsafe { core::ptr::read_volatile((fixup_runtime + 4) as *const u32) };
-    let starts_base = fixup_runtime + u64::from(starts_offset);
-
-    // dyld_chained_starts_in_image { seg_count(4), seg_info_offset[seg_count](4 each) }
-    // SAFETY: starts_base is within loaded RAM.
-    let seg_count = unsafe { core::ptr::read_volatile(starts_base as *const u32) } as usize;
-
-    for seg_idx in 0..seg_count {
-        let seg_off_ptr = (starts_base + 4 + (seg_idx as u64) * 4) as *const u32;
-        // SAFETY: within loaded RAM.
-        let seg_info_off = unsafe { core::ptr::read_volatile(seg_off_ptr) };
-        if seg_info_off == 0 {
-            continue;
-        }
-
-        let seg_info = starts_base + u64::from(seg_info_off);
-        // dyld_chained_starts_in_segment:
-        //   size(4) page_size(2) pointer_format(2) segment_offset(8)
-        //   max_valid_pointer(4) page_count(2) page_start[page_count](2 each)
-        // SAFETY: seg_info is within loaded RAM; offsets match the struct layout.
-        let page_size =
-            u64::from(unsafe { core::ptr::read_volatile((seg_info + 4) as *const u16) });
-        // SAFETY: same as above.
-        let ptr_format = unsafe { core::ptr::read_volatile((seg_info + 6) as *const u16) };
-        // SAFETY: same as above.
-        let segment_offset = unsafe { core::ptr::read_volatile((seg_info + 8) as *const u64) };
-        // SAFETY: same as above.
-        let page_count =
-            u64::from(unsafe { core::ptr::read_volatile((seg_info + 20) as *const u16) });
-
-        // Only handle format 12 (DYLD_CHAINED_PTR_ARM64E_USERLAND).
-        if ptr_format != 12 {
-            uart::write_str("xnu-rs: unknown fixup format ");
-            uart::write_hex_u64(u64::from(ptr_format));
-            uart::write_str("\n");
-            continue;
-        }
-
-        for page_idx in 0..page_count {
-            let start_off_ptr = (seg_info + 22 + page_idx * 2) as *const u16;
-            // SAFETY: within loaded RAM.
-            let page_start = unsafe { core::ptr::read_volatile(start_off_ptr) };
-            if page_start == 0xFFFF {
-                continue; // no fixups on this page
-            }
-
-            let page_addr = load_base + segment_offset + page_idx * page_size;
-            let mut ptr_addr = page_addr + u64::from(page_start);
-
-            loop {
-                // SAFETY: ptr_addr is in loaded RAM.
-                let val = unsafe { core::ptr::read_volatile(ptr_addr as *const u64) };
-
-                let auth = (val >> 63) & 1;
-                let bind = (val >> 62) & 1;
-                let next;
-
-                if bind != 0 {
-                    // Bind — dyld has 0 imports, skip.
-                    next = (val >> 51) & 0x7FF;
-                } else if auth != 0 {
-                    // Authenticated rebase.
-                    let target32 = val & 0xFFFF_FFFF;
-                    next = (val >> 51) & 0x7FF;
-                    let new_val = slide + target32;
-                    // SAFETY: ptr_addr is writable loaded RAM.
-                    unsafe { core::ptr::write_volatile(ptr_addr as *mut u64, new_val) };
-                } else {
-                    // Plain rebase.
-                    let target32 = val & 0xFFFF_FFFF;
-                    let high8 = (val >> 32) & 0xFF;
-                    next = (val >> 51) & 0x7FF;
-                    let new_val = slide + target32 + (high8 << 56);
-                    // SAFETY: ptr_addr is writable loaded RAM.
-                    unsafe { core::ptr::write_volatile(ptr_addr as *mut u64, new_val) };
-                }
-
-                if next == 0 {
-                    break;
-                }
-                ptr_addr += next * 8;
-            }
-        }
-    }
-    uart::write_str("xnu-rs: dyld fixups applied\n");
 }
 
 const fn align_up(value: u64, align: u64) -> u64 {

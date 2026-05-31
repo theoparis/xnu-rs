@@ -15,4 +15,5 @@ object.workspace = true
 aarch64-cpu.workspace = true
 aarch64-paging.workspace = true
 arm-gic.workspace = true
-zs-alloc = { path = "../zs-alloc" }
+zs-alloc.workspace = true
+loader.workspace = true

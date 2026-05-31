@@ -10,5 +10,3 @@ workspace = true
 
 [dependencies]
 object.workspace = true
-log.workspace = true
-uefi = { workspace = true, features = ["alloc", "global_allocator", "logger"] }

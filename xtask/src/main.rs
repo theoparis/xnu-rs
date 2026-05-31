@@ -110,6 +110,7 @@ fn check() -> io::Result<bool> {
         &["check", "-p", KERNEL_NAME, "--target", TARGET],
         &["check", "-p", LOADER_NAME, "--target", UEFI_TARGET],
         &["check", "-p", "zs-alloc", "--target", TARGET],
+        &["check", "-p", "macho", "--target", TARGET],
         &["check", "-p", "xtask"],
     ])
 }
@@ -122,15 +123,23 @@ fn clippy(extra_args: &[String]) -> io::Result<bool> {
     let mut kernel_args = vec!["clippy", "-p", KERNEL_NAME, "--target", TARGET];
     let mut loader_args = vec!["clippy", "-p", LOADER_NAME, "--target", UEFI_TARGET];
     let mut alloc_args = vec!["clippy", "-p", "zs-alloc", "--target", TARGET];
+    let mut macho_args = vec!["clippy", "-p", "macho", "--target", TARGET];
     let mut xtask_args = vec!["clippy", "-p", "xtask"];
 
     // Forward the raw JSON flag strings passed from rust-analyzer directly into the subprocesses
     kernel_args.extend(&extra_slices);
     loader_args.extend(&extra_slices);
     alloc_args.extend(&extra_slices);
+    macho_args.extend(&extra_slices);
     xtask_args.extend(&extra_slices);
 
-    cargo_many(&[&kernel_args, &loader_args, &alloc_args, &xtask_args])
+    cargo_many(&[
+        &kernel_args,
+        &loader_args,
+        &alloc_args,
+        &macho_args,
+        &xtask_args,
+    ])
 }
 
 fn build_image() -> io::Result<bool> {

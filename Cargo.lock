@@ -120,6 +120,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
 
 [[package]]
+name = "bootloader"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "object",
+ "uefi",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -340,6 +349,7 @@ dependencies = [
  "aarch64-cpu",
  "aarch64-paging",
  "arm-gic",
+ "loader",
  "log",
  "object",
  "spin",
@@ -362,9 +372,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 name = "loader"
 version = "0.1.0"
 dependencies = [
- "log",
  "object",
- "uefi",
 ]
 
 [[package]]
